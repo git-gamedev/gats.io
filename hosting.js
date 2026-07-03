@@ -8,11 +8,13 @@
 //
 // IMPORTANT: once the server Worker is running, this file's job is done.
 // btn-host is the exception to "no direct interactions" - it's the one
-// moment this client is allowed to touch the server directly (spawning it).
+// moment this client is allowed to touch the server directly (spawning it,
+// and sending it the host's chosen config once, right after spawning).
 // after that, if THIS client wants to play on the server it just hosted, it
 // connects over the network exactly like any other client would - no
-// postMessage game traffic, no shared state. the handshake below exists
-// purely to confirm the worker booted, not as a channel for anything else.
+// postMessage game traffic, no shared state. the config message and the
+// 'ready' reply are a one-off boot handshake, not a channel for anything
+// beyond startup.
 //
 // deliberately minimal: this file only knows how to spawn a browser-hosted
 // server Worker. registry registration/heartbeat lives in server.js itself,
@@ -23,27 +25,63 @@
 const SERVER_DISPATCH_URL = 'https://gats-server-dispatch.gitgames.workers.dev';
 
 const btnHost = document.getElementById('btn-host');
+const hostConfigOverlay = document.getElementById('host-config-overlay');
+const maxPlayersInput = document.getElementById('host-config-max-players');
+const btnHostConfigCancel = document.getElementById('btn-host-config-cancel');
+const btnHostConfigStart = document.getElementById('btn-host-config-start');
 
 let serverWorker = null;    // the running server Worker, or null if none is hosted
 let serverWorkerUrl = null; // blob: URL backing it, kept so we can revoke it on teardown
 
-if (!btnHost) {
-  console.error('Hosting setup failed - missing element: btn-host');
+if (!btnHost || !hostConfigOverlay || !maxPlayersInput || !btnHostConfigCancel || !btnHostConfigStart) {
+  console.error('Hosting setup failed - missing element:', {
+    btnHost, hostConfigOverlay, maxPlayersInput, btnHostConfigCancel, btnHostConfigStart
+  });
 } else {
   btnHost.addEventListener('click', onHostButtonClick);
+  btnHostConfigCancel.addEventListener('click', closeHostConfigOverlay);
+  btnHostConfigStart.addEventListener('click', onHostConfigConfirmed);
 }
 
-// single click handler for the dual-purpose button: starts a server if none
-// is running, stops it if one is.
+// single click handler for the dual-purpose button: opens the config panel
+// to start a server if none is running, stops it directly if one is (no
+// config needed to stop).
 function onHostButtonClick() {
   if (serverWorker) {
     stopServer();
   } else {
-    hostServer();
+    openHostConfigOverlay();
   }
 }
 
-async function hostServer() {
+function openHostConfigOverlay() {
+  menuOverlay.classList.add('hidden');
+  hostConfigOverlay.classList.remove('hidden');
+}
+
+function closeHostConfigOverlay() {
+  hostConfigOverlay.classList.add('hidden');
+  menuOverlay.classList.remove('hidden'); // back to the server list
+}
+
+// reads the config panel's fields, validates them, and - if valid - closes
+// the panel and actually starts the server with that config. this is the
+// one place field values get parsed out of the DOM; hostServer() itself
+// just takes a plain config object, so it doesn't care where the values
+// came from.
+function onHostConfigConfirmed() {
+  const maxPlayers = parseInt(maxPlayersInput.value, 10);
+
+  if (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > 32) {
+    maxPlayersInput.reportValidity();
+    return;
+  }
+
+  closeHostConfigOverlay();
+  hostServer({ maxPlayers });
+}
+
+async function hostServer(hostConfig) {
   setHostButtonState('starting');
 
   let serverSource;
@@ -76,6 +114,12 @@ async function hostServer() {
 
   serverWorker.addEventListener('message', handleServerMessage);
   serverWorker.addEventListener('error', handleServerError);
+
+  // one-off boot handshake, not ongoing game traffic - the browser queues
+  // messages sent to a Worker before its listener attaches, so this is
+  // safe to send immediately without waiting for anything back first.
+  // server.js waits for this before registering or sending 'ready'.
+  serverWorker.postMessage({ type: 'config', config: hostConfig });
 }
 
 function handleServerMessage(event) {

@@ -59,6 +59,26 @@
     </div>
   </div>
 
+  <!-- host config panel, hidden until "Host Server" is clicked in the server list menu -->
+  <div id="host-config-overlay" class="overlay hidden">
+    <div id="host-config-panel" class="panel">
+      <h2>Host Server</h2>
+
+      <div class="setting-row">
+        <label for="host-config-max-players">Max players</label>
+        <input type="number" id="host-config-max-players" min="1" max="32" value="8">
+      </div>
+
+      <!-- future host-configurable settings (fog, allowed weapons, etc.)
+           go here as more .setting-row entries -->
+
+      <div id="host-config-actions">
+        <button id="btn-host-config-cancel">Cancel</button>
+        <button id="btn-host-config-start">Start Hosting</button>
+      </div>
+    </div>
+  </div>
+
   <!-- stack of temporary notification cards rises here -->
   <div id="card-stack"></div>
 
@@ -67,6 +87,7 @@
   <script src="players.js"></script>
   <script src="client.js"></script>
   <script src="cards.js"></script>
+  <script src="server-browser.js"></script>
   <script src="hosting.js"></script>
   <script src="script.js"></script>
 </body>
