@@ -68,10 +68,15 @@ function drawGrid() {
   }
 }
 
-function draw(now) {
+let lastFrameTime = null; // rAF timestamp of the previous frame, for computing dt
+
+function draw(now, dt) {
   ctx.fillStyle = getBackgroundColor();
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   drawGrid();
+
+  updatePlayers(dt);
+  drawPlayers();
 
   updateInputMessage(now);
 }
@@ -79,9 +84,14 @@ function draw(now) {
 // runs every frame: redraws the canvas based on current state (camera, etc).
 // later this is also where player/entity updates will happen before drawing.
 // `now` is the rAF-provided timestamp, threaded through to draw() so
-// updateInputMessage can track its own 500ms "set message" interval.
+// updateInputMessage can track its own 500ms "set message" interval. also
+// used here to derive dt (seconds since last frame) for framerate-independent
+// lerping of player visuals.
 function gameLoop(now) {
-  draw(now);
+  const dt = lastFrameTime === null ? 0 : (now - lastFrameTime) / 1000;
+  lastFrameTime = now;
+
+  draw(now, dt);
   requestAnimationFrame(gameLoop);
 }
 
