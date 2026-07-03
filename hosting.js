@@ -72,7 +72,7 @@ function closeHostConfigOverlay() {
 function onHostConfigConfirmed() {
   const maxPlayers = parseInt(maxPlayersInput.value, 10);
 
-  if (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > 32) {
+  if (!Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > 100) {
     maxPlayersInput.reportValidity();
     return;
   }
@@ -122,10 +122,20 @@ async function hostServer(hostConfig) {
   serverWorker.postMessage({ type: 'config', config: hostConfig });
 }
 
+// startup.js sets this if it needs to know when the server it just told us
+// to host has actually made it into the registry (not just booted - see
+// the 'registered' case below). null the rest of the time; hosting.js has
+// no opinion on why anyone would want this, it just relays the one event.
+let onServerRegistered = null;
+
 function handleServerMessage(event) {
-  if (event.data && event.data.type === 'ready') {
+  if (!event.data) return;
+
+  if (event.data.type === 'ready') {
     console.log('Server worker is up and running.');
     setHostButtonState('running');
+  } else if (event.data.type === 'registered') {
+    if (onServerRegistered) onServerRegistered(event.data.sessionId);
   }
   // server.js will grow more message types (status, player counts, etc.)
   // later - this handler is the one place to add cases for those.
@@ -145,6 +155,7 @@ function stopServer() {
     URL.revokeObjectURL(serverWorkerUrl);
     serverWorkerUrl = null;
   }
+  onServerRegistered = null;
   setHostButtonState('idle');
 }
 

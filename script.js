@@ -22,3 +22,6 @@ if (!menuOverlay || !btnServers || !btnClose) {
 
 // hand off to client.js for canvas/game setup
 initClient();
+
+// find or host a server and connect automatically - no user action needed
+autoConnect();

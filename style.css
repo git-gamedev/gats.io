@@ -107,6 +107,8 @@ html, body {
   gap: 8px;
   margin-top: 12px;
 }
+
+#server-list {
   width: 100%;
   min-height: 120px;
   max-height: 300px;
