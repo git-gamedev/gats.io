@@ -13,6 +13,12 @@
 // connects over the network exactly like any other client would - no
 // postMessage game traffic, no shared state. the handshake below exists
 // purely to confirm the worker booted, not as a channel for anything else.
+//
+// deliberately minimal: this file only knows how to spawn a browser-hosted
+// server Worker. registry registration/heartbeat lives in server.js itself,
+// not here - so that a permanent, standalone-hosted server (someone running
+// server.js directly via node, no browser tab at all) registers itself the
+// same way without this file being involved at all.
 
 const SERVER_DISPATCH_URL = 'https://gats-server-dispatch.gitgames.workers.dev';
 
