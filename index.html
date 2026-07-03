@@ -1,1 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Game</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
 
+  <!-- full-page canvas, will render the current server's game state (0,0 for now) -->
+  <canvas id="game-canvas"></canvas>
+
+  <!-- settings gear, top right, visible on the main menu -->
+  <button id="btn-settings" aria-label="Settings">&#9881;</button>
+
+  <!-- start screen UI, max 50% screen width -->
+  <div id="ui-area">
+    <div id="weapon-select">Weapon selection (large)</div>
+    <div id="row2">
+      <div id="shield-select">Shield amount (small)</div>
+      <button id="btn-servers">Servers</button>
+      <button id="btn-play">Play</button>
+    </div>
+  </div>
+
+  <!-- server list menu, hidden until "Servers" is clicked -->
+  <div id="menu-overlay" class="overlay hidden">
+    <div id="menu" class="panel">
+      <div id="server-list">Open servers will list here</div>
+      <button id="btn-host">Host Server</button>
+      <button id="btn-close">Close</button>
+    </div>
+  </div>
+
+  <!-- settings menu, hidden until the gear icon is clicked -->
+  <div id="settings-overlay" class="overlay hidden">
+    <div id="settings-panel" class="panel">
+      <h2>Settings</h2>
+
+      <div class="setting-row">
+        <label for="setting-bg-color">Background color</label>
+        <input type="color" id="setting-bg-color">
+      </div>
+
+      <div class="setting-row">
+        <label for="setting-grid-color">Gridline color</label>
+        <input type="color" id="setting-grid-color">
+      </div>
+
+      <div class="setting-row">
+        <label for="setting-grid-opacity">Gridline opacity</label>
+        <input type="range" id="setting-grid-opacity" min="0" max="1" step="0.001">
+      </div>
+
+      <h3>Keybinds</h3>
+      <div id="keybind-list"></div>
+
+      <button id="btn-settings-back">Back</button>
+    </div>
+  </div>
+
+  <!-- stack of temporary notification cards rises here -->
+  <div id="card-stack"></div>
+
+  <script src="settings.js"></script>
+  <script src="input.js"></script>
+  <script src="client.js"></script>
+  <script src="cards.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
