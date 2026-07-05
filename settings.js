@@ -1,7 +1,6 @@
 // settings.js
-// owns user-configurable settings (background color, gridline color,
-// keybinds) and the settings panel UI. client.js reads the color values
-// through the getters below every frame.
+
+const WRITER_LABEL = 'settings-panel'; // identifies this file's calls in save.js's logs
 
 const ACTIONS = ['left', 'up', 'right', 'down', 'fire', 'reload', 'ability'];
 
@@ -29,25 +28,31 @@ const DEFAULT_BACKGROUND_COLOR = '#111111'; // matches the canvas's original def
 const DEFAULT_GRIDLINE_COLOR = '#ffffff';
 const DEFAULT_GRIDLINE_OPACITY = 0.025; // all gridlines share the same color/opacity/thickness
 
-const settings = {
-  backgroundColor: DEFAULT_BACKGROUND_COLOR,
-  gridlineColor: DEFAULT_GRIDLINE_COLOR,
-  gridlineOpacity: DEFAULT_GRIDLINE_OPACITY,
-  keybinds: {}
-};
+// Seed save.data with defaults, the same way the old top-level `settings`
+// object used to be built. This still only ever writes into memory
+// (save.data's private `data` object, mirrored to save.public) — it does
+// not touch any actual file on disk, same as before.
+const defaultKeybinds = {};
 for (const action of ACTIONS) {
-  settings.keybinds[action] = [...DEFAULT_KEYBINDS[action]];
+  defaultKeybinds[action] = [...DEFAULT_KEYBINDS[action]];
 }
+save.data.writePublic('backgroundColor', DEFAULT_BACKGROUND_COLOR, WRITER_LABEL);
+save.data.writePublic('gridlineColor', DEFAULT_GRIDLINE_COLOR, WRITER_LABEL);
+save.data.writePublic('gridlineOpacity', DEFAULT_GRIDLINE_OPACITY, WRITER_LABEL);
+save.data.writePublic('keybinds', defaultKeybinds, WRITER_LABEL);
 
 // --- getters used by client.js every frame ---
+// these now read straight from save.public instead of a local `settings`
+// object — save.public IS the current source of truth after the seed
+// step above.
 
 function getBackgroundColor() {
-  return settings.backgroundColor;
+  return save.public.backgroundColor;
 }
 
 function getGridlineColor() {
-  const { r, g, b } = hexToRgb(settings.gridlineColor);
-  return `rgba(${r}, ${g}, ${b}, ${settings.gridlineOpacity})`;
+  const { r, g, b } = hexToRgb(save.public.gridlineColor);
+  return `rgba(${r}, ${g}, ${b}, ${save.public.gridlineOpacity})`;
 }
 
 function hexToRgb(hex) {
@@ -71,20 +76,20 @@ const gridOpacityInput = document.getElementById('setting-grid-opacity');
 const keybindList = document.getElementById('keybind-list');
 const backBtn = document.getElementById('btn-settings-back');
 
-bgColorInput.value = settings.backgroundColor;
-gridColorInput.value = settings.gridlineColor;
-gridOpacityInput.value = settings.gridlineOpacity;
+bgColorInput.value = save.public.backgroundColor;
+gridColorInput.value = save.public.gridlineColor;
+gridOpacityInput.value = save.public.gridlineOpacity;
 
 bgColorInput.addEventListener('input', () => {
-  settings.backgroundColor = bgColorInput.value;
+  save.data.writePublic('backgroundColor', bgColorInput.value, WRITER_LABEL);
 });
 
 gridColorInput.addEventListener('input', () => {
-  settings.gridlineColor = gridColorInput.value;
+  save.data.writePublic('gridlineColor', gridColorInput.value, WRITER_LABEL);
 });
 
 gridOpacityInput.addEventListener('input', () => {
-  settings.gridlineOpacity = parseFloat(gridOpacityInput.value);
+  save.data.writePublic('gridlineOpacity', parseFloat(gridOpacityInput.value), WRITER_LABEL);
 });
 
 function openSettings() {
@@ -127,7 +132,7 @@ function renderKeybinds() {
     const chips = document.createElement('div');
     chips.className = 'keybind-chips';
 
-    for (const bind of settings.keybinds[action]) {
+    for (const bind of save.public.keybinds[action]) {
       const chip = document.createElement('span');
       chip.className = 'keybind-chip';
       chip.append(bind + ' ');
@@ -136,7 +141,7 @@ function renderKeybinds() {
       removeBtn.className = 'remove-bind';
       removeBtn.textContent = '\u00d7';
       // an action must always keep at least one keybind
-      removeBtn.disabled = settings.keybinds[action].length <= 1;
+      removeBtn.disabled = save.public.keybinds[action].length <= 1;
       removeBtn.addEventListener('click', () => removeKeybind(action, bind));
 
       chip.appendChild(removeBtn);
@@ -157,16 +162,35 @@ function renderKeybinds() {
   }
 }
 
+// Keybinds are stored as ONE object under the single key "keybinds" in
+// save.data (matching writePublic('keybinds', defaultKeybinds, ...) above)
+// rather than one save key per action. So every keybind change reads the
+// whole keybinds object out, mutates a local working copy, and writes the
+// WHOLE object back via writePublic — writePublic has no concept of
+// "just update one nested field," it replaces whatever value is passed in
+// under that key.
+
 function removeKeybind(action, bind) {
-  const binds = settings.keybinds[action];
+  const binds = save.public.keybinds[action];
   if (binds.length <= 1) return; // must keep at least one keybind for every action
-  settings.keybinds[action] = binds.filter(b => b !== bind);
+
+  const updatedKeybinds = structuredClone(save.public.keybinds);
+  updatedKeybinds[action] = binds.filter(b => b !== bind);
+  save.data.writePublic('keybinds', updatedKeybinds, WRITER_LABEL);
   renderKeybinds();
 }
 
 function addKeybind(action, bind) {
-  const binds = settings.keybinds[action];
-  if (!binds.includes(bind)) binds.push(bind);
+  const binds = save.public.keybinds[action];
+  if (binds.includes(bind)) {
+    listeningForAction = null;
+    renderKeybinds();
+    return;
+  }
+
+  const updatedKeybinds = structuredClone(save.public.keybinds);
+  updatedKeybinds[action] = [...binds, bind];
+  save.data.writePublic('keybinds', updatedKeybinds, WRITER_LABEL);
   listeningForAction = null;
   renderKeybinds();
 }

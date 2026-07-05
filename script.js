@@ -20,8 +20,31 @@ if (!menuOverlay || !btnServers || !btnClose) {
   });
 }
 
-// hand off to client.js for canvas/game setup
-initClient();
+let worker;
 
-// find or host a server and connect automatically - no user action needed
-autoConnect();
+(() => {
+  worker = new Worker('./server.js');
+  attachServerWorker(worker);
+
+  const serverPC = new RTCPeerConnection();
+  const serverChannel = serverPC.createDataChannel('game');
+  setServerChannel(serverChannel);
+
+  const clientPC = new RTCPeerConnection();
+  clientPC.ondatachannel = (e) => {
+    setClientChannel(e.channel);
+  };
+
+  serverPC.onicecandidate = (e) => { if (e.candidate) clientPC.addIceCandidate(e.candidate); };
+  clientPC.onicecandidate = (e) => { if (e.candidate) serverPC.addIceCandidate(e.candidate); };
+
+  (async () => {
+    const offer = await serverPC.createOffer();
+    await serverPC.setLocalDescription(offer);
+    await clientPC.setRemoteDescription(offer);
+
+    const answer = await clientPC.createAnswer();
+    await clientPC.setLocalDescription(answer);
+    await serverPC.setRemoteDescription(answer);
+  })();
+})();
