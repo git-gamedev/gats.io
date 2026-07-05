@@ -279,3 +279,28 @@ html, body {
   border-radius: 4px;
   transition: bottom 0.5s ease;
 }
+
+#mini-map {
+  position: fixed;
+
+  left: auto;
+  top: 0;
+  right: 0;
+
+  margin: 3rem;
+
+  width: 15rem;
+  height: 15rem;
+
+  background-color: transparent;
+
+  transition: opacity 0.5s;
+}
+
+#mini-map:hover {
+  opacity: 0.25;
+}
+
+.hidden {
+  opacity: 0;
+}

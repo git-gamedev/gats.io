@@ -97,6 +97,11 @@ const dataProviders = {
     height: ARENA_HEIGHT,
     borderThickness: ARENA_BORDER_THICKNESS,
   }),
+
+  // The 8 player spawn points, world-space { x, y } centers. Static after
+  // spawnSpawnPoints() runs once at startup (same lifetime as BOXES/
+  // ARENA_SIZE above), so 'once' is the natural fit here too.
+  SPAWN_POINTS: () => spawnPoints,
 };
 
 // requestId -> { dataType, lastSentJSON }, one entry per ACTIVE CONTINUOUS
@@ -395,6 +400,96 @@ function circleAABBCollision(px, py, radius, extent) {
   return { nx: dx / dist, ny: dy / dist, depth: radius - dist };
 }
 
+// --- player spawn points ---
+// 8 points at even 45° angular intervals around the arena center, sitting
+// at the radius halfway between the center and the edge. "Halfway to the
+// edge" uses the SHORTER of the two arena axes — if width and height ever
+// diverge, using the shorter axis guarantees every spawn point still lands
+// safely inside the arena interior on both axes, rather than a longer axis
+// pushing points outside the interior on the shorter one.
+//
+// Each point gets SPAWN_POINT_MAX_ATTEMPTS tries to land clear of every box.
+// Every attempt except the last jitters around the ideal angle/radius
+// slightly (a retry that re-checked the exact same spot would always get
+// the exact same answer, so there'd be no point retrying at all) — the
+// FINAL attempt gives up on jittering, snaps back to the exact ideal
+// point, and instead deletes whatever boxes are still in the way. This
+// guarantees every spawn point ends up usable, and guarantees it stays
+// close to its intended even-interval position rather than drifting
+// wherever the last jitter attempt happened to land.
+const SPAWN_POINT_COUNT = 8;
+const SPAWN_POINT_MAX_ATTEMPTS = 10;
+const SPAWN_POINT_RADIUS = PLAYER_RADIUS * 2; // spawn circle's own radius, not its distance from center
+const SPAWN_POINT_JITTER = 3; // world units, max random offset per axis on non-final attempts
+
+const spawnPoints = []; // [{ x, y }, ...], filled once by spawnSpawnPoints()
+
+// returns every box whose AABB overlaps a circle of SPAWN_POINT_RADIUS at
+// (x, y). Uses getBoxExtent/circleAABBCollision directly rather than the
+// boxesByMinX spatial index/getCandidateBoxes broad-phase — that index is
+// sized and margined for player-radius queries during the tick loop, and
+// SPAWN_POINT_COUNT (8) is tiny, so a plain scan over all boxes here is
+// simpler and in no way a bottleneck (this only ever runs once, at startup).
+function getBoxesOverlappingCircle(x, y, radius) {
+  return boxes.filter(box => circleAABBCollision(x, y, radius, getBoxExtent(box)) !== null);
+}
+
+// spawns SPAWN_POINT_COUNT points evenly around the arena center. See the
+// comment above for the retry/jitter/give-up-and-clear shape.
+function spawnSpawnPoints() {
+  const spawnRadius = Math.min(ARENA_WIDTH, ARENA_HEIGHT) / 4; // "/4" = halfway from center (/2) to edge
+
+  for (let i = 0; i < SPAWN_POINT_COUNT; i++) {
+    const angle = (i / SPAWN_POINT_COUNT) * Math.PI * 2;
+    const idealX = Math.cos(angle) * spawnRadius;
+    const idealY = Math.sin(angle) * spawnRadius;
+
+    let placed = false;
+    for (let attempt = 0; attempt < SPAWN_POINT_MAX_ATTEMPTS - 1; attempt++) {
+      const x = idealX + (Math.random() * 2 - 1) * SPAWN_POINT_JITTER;
+      const y = idealY + (Math.random() * 2 - 1) * SPAWN_POINT_JITTER;
+
+      if (getBoxesOverlappingCircle(x, y, SPAWN_POINT_RADIUS).length === 0) {
+        spawnPoints.push({ x, y });
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) {
+      // last attempt: stop jittering, snap to the exact ideal point, and
+      // force it clear by deleting whatever boxes are still in the way
+      // rather than leaving the point unusable
+      const blocking = getBoxesOverlappingCircle(idealX, idealY, SPAWN_POINT_RADIUS);
+      if (blocking.length > 0) {
+        console.warn(`[server] spawn point ${i} still blocked after ${SPAWN_POINT_MAX_ATTEMPTS - 1} attempts, deleting ${blocking.length} box(es)`);
+        for (const box of blocking) {
+          const idx = boxes.indexOf(box);
+          if (idx !== -1) boxes.splice(idx, 1);
+        }
+      }
+      spawnPoints.push({ x: idealX, y: idealY });
+    }
+  }
+
+  console.log(`[server] placed ${spawnPoints.length} spawn points`, spawnPoints);
+}
+
+spawnSpawnPoints();
+
+// spawnSpawnPoints() above can delete boxes (see its final-attempt
+// give-up path), which shrinks `boxes` after buildSpatialIndex() already
+// ran on the pre-deletion array — so the index has to be rebuilt
+// afterward, or boxesByMinX could hold stale entries pointing at box
+// indices that no longer exist (or worse, now point at a different box
+// that shifted into that slot after splice()).
+buildSpatialIndex();
+
+// picks a uniformly random spawn point — used whenever a player joins.
+function getRandomSpawnPoint() {
+  return spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+}
+
 // resolves box collisions for one player: each overlapping candidate is
 // depenetrated and bounced individually, in sequence, against the player's
 // position as corrected by the previous box in the same pass. No normal
@@ -586,8 +681,10 @@ function decodeInputs(code) {
 const msgHandler = {
   JOIN_REQUEST: (msg) => {
     const playerPrimitive = formPlayerPrimitive();
+    const spawn = getRandomSpawnPoint();
+    playerPrimitive.position = { x: spawn.x, y: spawn.y };
     players[msg.playerID] = structuredClone(playerPrimitive);
-    console.log(`[server] playerID ${msg.playerID} has joined!`);
+    console.log(`[server] playerID ${msg.playerID} has joined at spawn point (${spawn.x.toFixed(1)}, ${spawn.y.toFixed(1)})!`);
     sendMessage('JOIN_RESPONSE', msg.playerID, players[msg.playerID]);
   },
   LEAVE_REQUEST: (msg) => {

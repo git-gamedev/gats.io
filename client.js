@@ -179,6 +179,7 @@ function hideAllMenus() {
   document.getElementById('menu-overlay').classList.add('hidden');
   document.getElementById('settings-overlay').classList.add('hidden');
   document.getElementById('host-config-overlay').classList.add('hidden');
+  document.getElementById('mini-map').classList.remove('hidden');
   document.getElementById('ui-area').style.display = 'none';
   document.getElementById('btn-settings').style.display = 'none';
 }
@@ -194,6 +195,44 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
+
+const minimap = document.getElementById('mini-map');
+const minictx = minimap.getContext('2d');
+
+(function resizeMinimap() {
+  minimap.width = 200;
+  minimap.height = 200;
+})();
+
+const MINIMAP_DOT_RADIUS = 4; // px
+const MINIMAP_DOT_COLOR = '#3399ff'; // matches player fill
+
+const MINIMAP_BORDER_THICKNESS_PX = 5;
+
+function drawMinimap() {
+  minictx.clearRect(0, 0, minimap.width, minimap.height);
+  minictx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+  minictx.fillRect(0, 0, minimap.width, minimap.height);
+
+  minictx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+  minictx.lineWidth = MINIMAP_BORDER_THICKNESS_PX;
+  minictx.strokeRect(
+    MINIMAP_BORDER_THICKNESS_PX / 2,
+    MINIMAP_BORDER_THICKNESS_PX / 2,
+    minimap.width - MINIMAP_BORDER_THICKNESS_PX,
+    minimap.height - MINIMAP_BORDER_THICKNESS_PX
+  );
+
+  if (arenaSize) {
+    const relX = (myPlayer.renderPos.x + arenaSize.width / 2) / arenaSize.width;
+    const relY = (myPlayer.renderPos.y + arenaSize.height / 2) / arenaSize.height;
+
+    minictx.beginPath();
+    minictx.arc(relX * minimap.width, relY * minimap.height, MINIMAP_DOT_RADIUS, 0, Math.PI * 2);
+    minictx.fillStyle = MINIMAP_DOT_COLOR;
+    minictx.fill();
+  }
+}
 
 // --- camera ---
 // Three tracked positions, all in world units:
@@ -404,8 +443,8 @@ function screenToWorld(screenX, screenY) {
 function worldToScreen(worldX, worldY) {
   const unitSize = getUnitPixelSize();
   return {
-    x: Math.round(canvas.width / 2 + (worldX - camera.renderpos.x) * unitSize),
-    y: Math.round(canvas.height / 2 + (worldY - camera.renderpos.y) * unitSize),
+    x: canvas.width / 2 + (worldX - camera.renderpos.x) * unitSize,
+    y: canvas.height / 2 + (worldY - camera.renderpos.y) * unitSize,
   };
 }
 
@@ -676,8 +715,9 @@ const EMPTY_GAMELOOP = (dt) => { return; };
 const TRUE_GAMELOOP = (dt) => {
   sendInputs(dt);
   predictPlayerPosition(dt);
-  updateCameraFollow(dt);
   drawPlayer();
+  drawArenaBorder();
+  drawMinimap();
 };
 
 let gameloop = EMPTY_GAMELOOP;
@@ -685,10 +725,11 @@ let gameloop = EMPTY_GAMELOOP;
 function clientloop(currentTime, lastTime) {
   const dt = (currentTime - lastTime) / 1000;
 
+  updateCameraFollow(dt); // camera settled BEFORE anything reads renderpos this frame
+
   drawGrid();
   drawBoxes();
   gameloop(dt);
-  drawArenaBorder();
 
   requestAnimationFrame((t) => clientloop(t, currentTime));
 }
