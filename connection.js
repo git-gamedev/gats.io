@@ -52,13 +52,127 @@ function _sendReal(isServer, type, ...args) {
 function setServerChannel(channel) {
   state.serverChannel = channel;
   channel.binaryType = 'arraybuffer';
-  channel.onmessage = (e) => queueServerMessage(decode(e.data));
+  channel.onmessage = (e) => {
+    const msg = decode(e.data);
+    if (msg.type === 'REQUEST_DATA') {
+      // bypasses the tick-based inbox entirely: REQUEST_DATA isn't keyed by
+      // playerID (the dedup-by-key scheme below assumes that), and data
+      // requests should reach server.js immediately rather than wait for
+      // the next pickupMessages() batch.
+      serverWorker.postMessage({ type: 'data-request', requestId: msg.requestId, dataType: msg.dataType, mode: msg.mode });
+      return;
+    }
+    queueServerMessage(msg);
+  };
+}
+
+// --- real "channel is open" signal ---
+// Replaces the old retry-on-a-timer workaround (see client.js's now-removed
+// joinUntilConfirmed HACKEYSACK comment). RTCDataChannel already fires a
+// real 'open' event; this just exposes it under the name the old comment
+// asked for. If the channel is ALREADY open by the time a caller registers
+// (e.g. registered late, after a fast handshake), the callback fires
+// immediately instead of being silently missed — checking readyState
+// defensively rather than assuming registration always wins the race.
+let clientReadyCallback = null;
+
+function onClientReady(callback) {
+  clientReadyCallback = callback;
+  if (state.clientChannel?.readyState === 'open') {
+    callback();
+  }
 }
 
 function setClientChannel(channel) {
   state.clientChannel = channel;
   channel.binaryType = 'arraybuffer';
-  channel.onmessage = (e) => state.clientHandler?.(decode(e.data));
+  channel.onopen = () => {
+    console.log('[connection] client channel open');
+    clientReadyCallback?.();
+  };
+  channel.onmessage = (e) => {
+    const msg = decode(e.data);
+    if (msg.type === 'RESPONSE_DATA') {
+      routeDataResponse(msg);
+      return;
+    }
+    state.clientHandler?.(msg);
+  };
+  // fires when the underlying connection actually breaks (network drop,
+  // remote tab closed, etc.) — NOT the same as receiving LEAVE_REQUEST,
+  // which is a message that assumes the channel is still alive to send it.
+  channel.onclose = () => {
+    console.log('[connection] client channel closed, notifying worker to clean up');
+    serverWorker?.postMessage({ type: 'client-disconnected' });
+  };
+}
+
+// =============================================================================
+// data request protocol — REQUEST_DATA / RESPONSE_DATA
+// =============================================================================
+//
+// Two request modes, both usable before JOIN_REQUEST is ever sent (this
+// rides the same channel/worker plumbing as everything else and doesn't
+// touch server.js's `players` map at all):
+//
+//   'once'       — fire, resolve/callback exactly once, then the entry is
+//                  deleted. requestData() also returns a Promise for this
+//                  mode so callers can `await` instead of passing a callback.
+//   'continuous' — server re-checks this data every tick and pushes again
+//                  only when the value has changed (see server.js's
+//                  dataSubscriptions). The callback is stored and re-invoked
+//                  on every push; it is NEVER auto-deleted — call
+//                  cancelDataRequest(requestId) to stop it.
+
+let requestIdCounter = 0;
+const pendingDataRequests = new Map(); // requestId -> { mode, callback }
+
+function requestData(dataType, mode, callback) {
+  const requestId = requestIdCounter++;
+
+  if (mode === 'once') {
+    return new Promise((resolve, reject) => {
+      pendingDataRequests.set(requestId, {
+        mode,
+        callback: (payload) => {
+          callback?.(payload); // optional: caller can use the callback, the Promise, or both
+          resolve(payload);
+        },
+      });
+      _sendReal(false, 'REQUEST_DATA', requestId, dataType, mode);
+    });
+  }
+
+  if (mode === 'continuous') {
+    if (typeof callback !== 'function') {
+      throw new Error('requestData(..., "continuous", callback) requires a callback');
+    }
+    pendingDataRequests.set(requestId, { mode, callback });
+    _sendReal(false, 'REQUEST_DATA', requestId, dataType, mode);
+    return requestId; // caller needs this to cancel later
+  }
+
+  throw new Error(`Unknown requestData mode: ${mode}`);
+}
+
+// stops a continuous subscription. server.js still holds its own
+// subscription entry until the client disconnects or explicitly tells it
+// to stop — this only silences the client-side callback. (Fully tearing
+// down the server-side subscription isn't wired up yet; flagging rather
+// than silently pretending this is a complete unsubscribe.)
+function cancelDataRequest(requestId) {
+  pendingDataRequests.delete(requestId);
+}
+
+function routeDataResponse(msg) {
+  const entry = pendingDataRequests.get(msg.requestId);
+  if (!entry) return; // response for a cancelled/unknown/already-resolved request
+
+  entry.callback(msg.payload);
+
+  if (entry.mode === 'once') {
+    pendingDataRequests.delete(msg.requestId);
+  }
 }
 
 // =============================================================================
@@ -157,6 +271,9 @@ const MessageType = {
   PLAYER_INPUTS: 0x05,
   PLAYER_AIM: 0x06,
   POSITION_PLAYER: 0x07,
+  REQUEST_DATA: 0x08,   // client -> server: "give me dataType", once or continuous
+  RESPONSE_DATA: 0x09,  // server -> client: payload for a previously requested dataType
+  CLIENT_DISCONNECTED: 0x0A, // main-thread -> worker only, never sent over the wire (see attachServerWorker)
 };
 
 const encoders = {
@@ -233,6 +350,28 @@ const encoders = {
     view.setFloat32(15, velocity.y);
     return buf;
   },
+  // REQUEST_DATA / RESPONSE_DATA carry arbitrary, variable-shape payloads
+  // (e.g. the full box array), unlike every message above which has a fixed
+  // binary layout. JSON-in-buffer is used here instead of DataView fields —
+  // trying to force arbitrary/nested data into a fixed layout would fight
+  // the format rather than extend it. Every other message type keeps its
+  // fixed binary encoding; this is a deliberate, isolated exception.
+  REQUEST_DATA: (requestId, dataType, mode) => {
+    const json = JSON.stringify({ requestId, dataType, mode });
+    const jsonBytes = new TextEncoder().encode(json);
+    const buf = new ArrayBuffer(1 + jsonBytes.byteLength);
+    new Uint8Array(buf, 0, 1)[0] = MessageType.REQUEST_DATA;
+    new Uint8Array(buf, 1).set(jsonBytes);
+    return buf;
+  },
+  RESPONSE_DATA: (requestId, dataType, payload) => {
+    const json = JSON.stringify({ requestId, dataType, payload });
+    const jsonBytes = new TextEncoder().encode(json);
+    const buf = new ArrayBuffer(1 + jsonBytes.byteLength);
+    new Uint8Array(buf, 0, 1)[0] = MessageType.RESPONSE_DATA;
+    new Uint8Array(buf, 1).set(jsonBytes);
+    return buf;
+  },
 };
 
 const decoders = {
@@ -268,6 +407,16 @@ const decoders = {
     position: { x: view.getFloat32(3), y: view.getFloat32(7) },
     velocity: { x: view.getFloat32(11), y: view.getFloat32(15) },
   }),
+  [MessageType.REQUEST_DATA]: (view) => {
+    const jsonBytes = new Uint8Array(view.buffer, view.byteOffset + 1, view.byteLength - 1);
+    const { requestId, dataType, mode } = JSON.parse(new TextDecoder().decode(jsonBytes));
+    return { type: 'REQUEST_DATA', requestId, dataType, mode };
+  },
+  [MessageType.RESPONSE_DATA]: (view) => {
+    const jsonBytes = new Uint8Array(view.buffer, view.byteOffset + 1, view.byteLength - 1);
+    const { requestId, dataType, payload } = JSON.parse(new TextDecoder().decode(jsonBytes));
+    return { type: 'RESPONSE_DATA', requestId, dataType, payload };
+  },
 };
 
 function encode(type, ...args) {

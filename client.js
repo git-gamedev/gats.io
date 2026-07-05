@@ -1,27 +1,47 @@
 // client.js
 
-// =============================================================================
-// ⚠️  TEMP / HACKEYSACK — will need to be reworked, not part of the real design
-// =============================================================================
-//
-// joinUntilConfirmed() retries JOIN_REQUEST on a blind interval because
-// connection.js doesn't expose a "channel is open" hook. This works, but it's
-// spamming attempts instead of reacting to a real event. Once connection.js
-// exposes something like onClientReady(callback), replace this whole function
-// with a single send triggered by that callback instead of a retry loop.
-
 save.data.writePublic('playerID', 0, 'client.js');
 
-async function joinUntilConfirmed() {
-  let joined = false;
+// --- connection lifecycle ---
+// onClientReady fires once, the moment the WebRTC data channel actually
+// opens (see connection.js) — this replaces the old joinUntilConfirmed
+// retry-on-a-timer workaround entirely. Connecting to the server and
+// joining the game are now two separate, explicit steps:
+//   1. onClientReady  -> register the message handler, fetch data needed
+//                        for rendering/menus (box layout) via a one-shot
+//                        REQUEST_DATA, but do NOT send JOIN_REQUEST yet.
+//   2. btn-play click -> send JOIN_REQUEST exactly once, on demand.
+// JOIN_RESPONSE/POSITION_PLAYER handling is registered in step 1 so it's
+// ready and listening well before the player ever clicks Play.
+
+// renderBoxes is the ONLY thing drawBoxes() ever reads. It's built once, via
+// bakeRenderBoxes() below, by combining the raw box instances (BOXES) with
+// the shape lookup table (BOX_DIMENSIONS) — width/height per box is resolved
+// exactly once here, not recomputed every frame. drawBoxes() becomes a flat
+// loop over pre-resolved { x, y, width, height } entries: zero lookup cost
+// per frame, forever, since neither source ever changes after initial load.
+let renderBoxes = null;
+
+// combines box instances with the dimensions table into a flat, render-ready
+// array. Kept as its own function (rather than inlined into onClientReady)
+// so it's easy to re-run later if box data ever becomes something that CAN
+// change post-load (e.g. destructible boxes) — right now it only ever runs
+// once, but the seam is there if that assumption changes.
+async function bakeRenderBoxes(boxes, dimensions) {
+  return boxes.map(box => {
+    const entry = dimensions[box.type];
+    const { width, height } = ('width' in entry) ? entry : (box.rotated ? entry.rotated : entry.unrotated);
+    return { x: box.position.x, y: box.position.y, width, height };
+  });
+}
+
+onClientReady(async () => {
+  console.log('[client] connection open, loading world data');
 
   pickupMessages(false, (msg) => {
     console.log('[client] received:', JSON.stringify(msg));
 
     if (msg.type === 'JOIN_RESPONSE' && msg.success) {
-      joined = true;
-      clearInterval(retryHandle);
-
       console.log('[debug] raw JOIN_RESPONSE:', JSON.stringify(msg));
       myPlayer.position = msg.position;
       myPlayer.velocity = msg.velocity;
@@ -31,8 +51,8 @@ async function joinUntilConfirmed() {
 
     if (msg.type === 'POSITION_PLAYER' && msg.playerID === save.public.playerID) {
       console.log('[debug] raw POSITION_PLAYER:', JSON.stringify(msg));
-      let correctionX = myPlayer.renderPos.x - msg.position.x;
-      let correctionY = myPlayer.renderPos.y - msg.position.y;
+      let correctionX = Math.min(Math.max(myPlayer.renderPos.x - msg.position.x, -0.05), 0.05);
+      let correctionY = Math.min(Math.max(myPlayer.renderPos.y - msg.position.y, -0.05), 0.05);
 
       // safety clamp: if the gap between predicted and authoritative position
       // is absurdly large (bad prediction, huge lag spike, etc.), don't carry
@@ -55,13 +75,25 @@ async function joinUntilConfirmed() {
     }
   });
 
-  const retryHandle = setInterval(() => {
-    if (joined) return;
-    sendMessage(false, 'JOIN_REQUEST', save.public.playerID);
-  }, 300);
-}
+  // fetched in parallel — neither depends on the other, no reason to
+  // serialize two independent round-trips
+  const [boxes, dimensions] = await Promise.all([
+    requestData('BOXES', 'once'),
+    requestData('BOX_DIMENSIONS', 'once'),
+  ]);
+  renderBoxes = await bakeRenderBoxes(boxes, dimensions);
+  console.log('[client] baked render boxes:', renderBoxes);
+});
 
-await joinUntilConfirmed();
+// btn-play sends JOIN_REQUEST exactly once, whenever the player actually
+// wants to start — no longer tied to connection open, and no longer a
+// retry loop. If the player clicks before the channel is open, sendMessage
+// will just log a DROPPED message (see connection.js's _sendReal), which is
+// an acceptable edge case for now since Play is only ever shown post-connect
+// in the current menu flow.
+document.getElementById('btn-play').addEventListener('click', () => {
+  sendMessage(false, 'JOIN_REQUEST', save.public.playerID);
+});
 
 // =============================================================================
 // 🍽️  MEAT AND POTATOES — the real, keep-building-on-this stuff
@@ -235,6 +267,66 @@ function worldToScreen(worldX, worldY) {
   };
 }
 
+// --- box rendering ---
+// renderBoxes (built once by bakeRenderBoxes, see above) already has
+// width/height resolved per entry — nothing here does a lookup or touches
+// boxDimensions/BOXES directly. This loop is the entire per-frame cost:
+// no branch, no table lookup, just reading pre-resolved numbers.
+
+const BOX_FILL_COLOR_SQUARE = '#8a6d3b';
+const BOX_FILL_COLOR_SKINNY = '#5c6b7a'; // grey-blue for non-square boxes
+const BOX_BORDER_THICKNESS_UNITS = 0.3; // game units, see drawBoxes for why this is inset rather than centered
+
+// contrast border color, same greyscale-then-flip logic as
+// getPlayerBorderColor() in the player-rendering section above — kept as a
+// separate function since it has no player-specific dependency, but if this
+// pattern is needed a third time it should probably be pulled into one
+// shared helper both call
+function getBoxBorderColor() {
+  const { r, g, b } = hexToRgb(save.public.backgroundColor);
+  const grey = 0.299 * r + 0.587 * g + 0.114 * b;
+  const contrast = (grey + 128) % 256;
+  return `rgb(${contrast}, ${contrast}, ${contrast})`;
+}
+
+// Boxes are axis-aligned (rotation locked to 0°/90° server-side), so this is
+// plain rect drawing in screen space — no canvas rotation transform needed,
+// same reasoning the server used to justify plain AABB collision math.
+function drawBoxes() {
+  if (!renderBoxes) return; // not baked yet (fetch + bakeRenderBoxes hasn't resolved)
+
+  const unitSize = getUnitPixelSize();
+  const borderPx = BOX_BORDER_THICKNESS_UNITS * unitSize;
+  const borderColor = getBoxBorderColor();
+
+  for (const box of renderBoxes) {
+    const isSquare = box.width === box.height;
+    const topLeft = worldToScreen(box.x - box.width / 2, box.y - box.height / 2);
+    const wPx = box.width * unitSize;
+    const hPx = box.height * unitSize;
+
+    // fill first, full box size — this is the hitbox, unaffected by border
+    ctx.fillStyle = isSquare ? BOX_FILL_COLOR_SQUARE : BOX_FILL_COLOR_SKINNY;
+    ctx.fillRect(topLeft.x, topLeft.y, wPx, hPx);
+
+    // border second, drawn INSET by half its own width so the stroke's
+    // outer edge lands exactly on the hitbox boundary. ctx.strokeRect
+    // centers the stroke on the path it's given — half the lineWidth draws
+    // outside that path, half inside — so stroking the box's own edges at
+    // full lineWidth would push borderPx/2 outside the hitbox on every
+    // side. Shrinking the stroked rect inward by borderPx/2 on each edge
+    // cancels that outward half, keeping the whole border within bounds.
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = borderPx;
+    ctx.strokeRect(
+      topLeft.x + borderPx / 2,
+      topLeft.y + borderPx / 2,
+      wPx - borderPx,
+      hPx - borderPx
+    );
+  }
+}
+
 // --- raw key/mouse state tracking ---
 // tracks exactly what's currently physically held down, independent of
 // which action(s) that key maps to — resolved against keybinds below.
@@ -392,6 +484,7 @@ function clientloop(currentTime, lastTime) {
   const dt = (currentTime - lastTime) / 1000;
 
   drawGrid();
+  drawBoxes();
   gameloop(dt);
 
   requestAnimationFrame((t) => clientloop(t, currentTime));
