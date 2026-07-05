@@ -88,6 +88,15 @@ const dataProviders = {
       rotated: { width: LONG_THICKNESS, height: LONG_LENGTH },
     },
   }),
+
+  // Arena play-field dimensions, centered on the origin. Static for the
+  // lifetime of the server (no mid-session resize), so 'once' is the
+  // natural fit — same reasoning as BOX_DIMENSIONS above.
+  ARENA_SIZE: () => ({
+    width: ARENA_WIDTH,
+    height: ARENA_HEIGHT,
+    borderThickness: ARENA_BORDER_THICKNESS,
+  }),
 };
 
 // requestId -> { dataType, lastSentJSON }, one entry per ACTIVE CONTINUOUS
@@ -161,8 +170,23 @@ const SQUARE_SIZE = 5;
 const LONG_LENGTH = 5;
 const LONG_THICKNESS = 1.5;
 
-const WORLD_HALF_EXTENT = 50; // boxes scatter within [-50, 50] on both axes
-const BOX_COUNT = 30;
+const BOX_COUNT = 1500;
+
+// arena play field, centered on the origin. Not a box in the `boxes` array —
+// it's the hard boundary every player and box lives inside, enforced
+// separately in resolveArenaBoundary() below (see that function for why it
+// reuses the same collision math as resolvePlayerCollisions rather than a
+// position clamp).
+const ARENA_WIDTH = 500;
+const ARENA_HEIGHT = 500;
+const ARENA_BORDER_THICKNESS = 0.5; // must match client.js's ARENA_BORDER_THICKNESS_UNITS
+
+// how many attempts spawnBoxes will make to place a single box before
+// giving up on it. Bounded rather than infinite so a pathological
+// combination of BOX_COUNT/arena size/box sizes (i.e. genuinely not enough
+// room to fit another box without overlap) can't hang the tick it runs on —
+// it just spawns fewer boxes than BOX_COUNT and logs how many it dropped.
+const BOX_SPAWN_MAX_ATTEMPTS = 200;
 
 const boxes = [];
 
@@ -178,19 +202,84 @@ function getBoxDimensions(box) {
     : { width: LONG_LENGTH, height: LONG_THICKNESS };
 }
 
+// AABB-vs-AABB overlap test for two candidate extents — plain rect
+// intersection, no penetration depth needed here since a spawn candidate
+// that overlaps at all just gets thrown away and re-rolled rather than
+// depenetrated.
+function aabbOverlap(a, b) {
+  return a.minX < b.maxX && a.maxX > b.minX &&
+         a.minY < b.maxY && a.maxY > b.minY;
+}
+
+// picks a random position + extent for a box of the given width/height,
+// fully inside the arena's playable interior (i.e. inset by the arena
+// border thickness, same interior the player boundary uses) so a box can
+// never spawn straddling or outside the wall — this is the "spawn within
+// bounds of whatever sized arena is chosen" half of the fix, since it reads
+// ARENA_WIDTH/ARENA_HEIGHT directly instead of a separate, disconnected
+// world-extent constant.
+function randomBoxExtent(width, height) {
+  const halfW = ARENA_WIDTH / 2 - ARENA_BORDER_THICKNESS;
+  const halfH = ARENA_HEIGHT / 2 - ARENA_BORDER_THICKNESS;
+
+  // the box's CENTER has to stay far enough from the interior edge that the
+  // box's own half-width/half-height doesn't poke through the wall. Clamped
+  // to >= 0 so a box that's actually wider/taller than the interior doesn't
+  // get a negative range (which would flip min/max on the random roll).
+  const rangeX = Math.max(halfW - width / 2, 0);
+  const rangeY = Math.max(halfH - height / 2, 0);
+
+  const x = (Math.random() * 2 - 1) * rangeX;
+  const y = (Math.random() * 2 - 1) * rangeY;
+
+  return {
+    position: { x, y },
+    extent: {
+      minX: x - width / 2,
+      maxX: x + width / 2,
+      minY: y - height / 2,
+      maxY: y + height / 2,
+    },
+  };
+}
+
+// spawns BOX_COUNT boxes, each retried against every box already placed so
+// far until it lands somewhere non-overlapping (or BOX_SPAWN_MAX_ATTEMPTS
+// runs out, in which case that box is skipped rather than spawned into
+// something else — see BOX_SPAWN_MAX_ATTEMPTS comment above). Checked
+// against the growing `placedExtents` array directly (plain O(n) scan per
+// attempt) rather than the boxesByMinX spatial index below, since that
+// index isn't built until AFTER spawnBoxes finishes (buildSpatialIndex()
+// runs once, on static post-spawn data) and n stays small (BOX_COUNT-sized)
+// here regardless.
+
+const MEADOW_SIZE = 35;
+
 function spawnBoxes() {
+  const placedExtents = [];
+
   for (let i = 0; i < BOX_COUNT; i++) {
     const type = Math.random() < 0.5 ? BOX_TYPE.SQUARE : BOX_TYPE.LONG;
-    boxes.push({
-      type,
-      position: {
-        x: (Math.random() * 2 - 1) * WORLD_HALF_EXTENT,
-        y: (Math.random() * 2 - 1) * WORLD_HALF_EXTENT,
-      },
-      rotated: type === BOX_TYPE.LONG ? Math.random() < 0.5 : false,
-    });
+    const rotated = type === BOX_TYPE.LONG ? Math.random() < 0.5 : false;
+    const { width, height } = getBoxDimensions({ type, rotated });
+
+    let placed = false;
+    for (let attempt = 0; attempt < BOX_SPAWN_MAX_ATTEMPTS; attempt++) {
+      const { position, extent } = randomBoxExtent(width, height);
+      if (placedExtents.some(other => aabbOverlap(extent, other))) continue;
+      if (Math.abs(position.x) < MEADOW_SIZE && Math.abs(position.y) < MEADOW_SIZE) continue;
+
+      boxes.push({ type, position, rotated });
+      placedExtents.push(extent);
+      placed = true;
+      break;
+    }
+
+    if (!placed) {
+      console.warn(`[server] gave up placing box ${i} after ${BOX_SPAWN_MAX_ATTEMPTS} attempts (no non-overlapping spot found)`);
+    }
   }
-  console.log(`[server] spawned ${boxes.length} boxes`);
+  console.log(`[server] spawned ${boxes.length}/${BOX_COUNT} boxes`);
 }
 
 spawnBoxes();
@@ -337,7 +426,61 @@ function resolvePlayerCollisions(player) {
   }
 }
 
-// --- player-vs-player collision ---
+// --- arena boundary ---
+// Treats the arena's four edges as collision surfaces, reusing the exact
+// same depenetrate + velocity-reflect approach as resolvePlayerCollisions
+// (see that function's comment for why per-surface resolution, not normal
+// blending). This is deliberate, not a shortcut: a position clamp
+// (`position.x = min(position.x, someLimit)`) can leave velocity pointed
+// into the wall with nothing to zero it, which is the exact class of bug
+// MOVING_EPSILON was added to fix for regular box collisions above — reusing
+// the same normal-based reflect keeps arena walls and boxes behaving
+// identically (including wall-running against either one), rather than
+// introducing a second, differently-behaved boundary mechanism.
+//
+// Checked independently per axis (unlike circleAABBCollision, which finds
+// one closest point): a player can only ever be pushed out through ONE
+// arena wall on a given axis at a time (can't be past both minX and maxX
+// simultaneously in a 500-unit arena), so there's no closest-point
+// ambiguity to resolve here the way there is for an interior box corner.
+function resolveArenaBoundary(player) {
+  const halfW = ARENA_WIDTH / 2;
+  const halfH = ARENA_HEIGHT / 2;
+
+  const minX = -halfW + PLAYER_RADIUS;
+  const maxX = halfW - PLAYER_RADIUS;
+  const minY = -halfH + PLAYER_RADIUS;
+  const maxY = halfH - PLAYER_RADIUS;
+
+  if (player.position.x < minX) {
+    applyArenaHit(player, minX - player.position.x, 1, 0);
+  } else if (player.position.x > maxX) {
+    applyArenaHit(player, player.position.x - maxX, -1, 0);
+  }
+
+  if (player.position.y < minY) {
+    applyArenaHit(player, minY - player.position.y, 0, 1);
+  } else if (player.position.y > maxY) {
+    applyArenaHit(player, player.position.y - maxY, 0, -1);
+  }
+}
+
+// depenetrate along (nx, ny) by depth, then reflect velocity the same way
+// resolvePlayerCollisions does for boxes — nx/ny here point from the wall
+// back toward the arena interior (i.e. the direction the player gets pushed)
+function applyArenaHit(player, depth, nx, ny) {
+  player.position.x += nx * depth;
+  player.position.y += ny * depth;
+
+  const vDotN = player.velocity.x * nx + player.velocity.y * ny;
+  if (vDotN < 0) {
+    const factor = (1 + RESTITUTION) * vDotN;
+    player.velocity.x -= factor * nx;
+    player.velocity.y -= factor * ny;
+  }
+}
+
+
 // All-pairs check, no spatial index. Player counts are expected to stay in
 // the dozens (unlike boxes, which head into the hundreds), so n*(n-1)/2
 // comparisons per tick is trivial — e.g. 100 players is ~4,950 checks. If
@@ -541,6 +684,7 @@ const methods = {
     resolveAllPlayerPairCollisions();
     for (const playerID in players) {
       resolvePlayerCollisions(players[playerID]);
+      resolveArenaBoundary(players[playerID]);
     }
   },
   bulletCollisions() {/*leave empty for now*/},

@@ -22,6 +22,76 @@ save.data.writePublic('playerID', 0, 'client.js');
 // per frame, forever, since neither source ever changes after initial load.
 let renderBoxes = null;
 
+// renderBoxesByMinX mirrors the server's boxesByMinX spatial index (see
+// server.js) — same reasoning applies here: boxes are static after load, so
+// this is built once, and only the X axis needs sorting since a binary
+// search on X narrows hundreds of boxes down to a small handful near the
+// camera, then a linear scan filters that handful by Y. Used by
+// getVisibleBoxes() below to skip boxes outside the current view instead of
+// looping over every box every frame.
+let renderBoxesByMinX = [];
+
+function buildRenderBoxIndex() {
+  renderBoxesByMinX = renderBoxes
+    .map((box, i) => ({
+      i,
+      minX: box.x - box.width / 2,
+      maxX: box.x + box.width / 2,
+      minY: box.y - box.height / 2,
+      maxY: box.y + box.height / 2,
+    }))
+    .sort((a, b) => a.minX - b.minX);
+}
+
+// index of the first entry in renderBoxesByMinX whose minX is >= x
+function findBoxInsertionIndex(x) {
+  let lo = 0, hi = renderBoxesByMinX.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (renderBoxesByMinX[mid].minX < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+// returns the renderBoxes entries whose AABB overlaps the given world-space
+// view rect — same broad-phase shape as the server's getCandidateBoxes:
+// binary search to the insertion point on X, walk outward until minX falls
+// outside the view, then linear-scan that small window for real overlap
+// (X range already guaranteed close, so this scan only needs to check Y —
+// plus a final X-max check for boxes whose minX qualified but that are wide
+// enough to still stick out past viewMaxX on their own).
+function getVisibleBoxes(viewMinX, viewMaxX, viewMinY, viewMaxY) {
+  const insertAt = findBoxInsertionIndex(viewMinX);
+  const candidates = [];
+
+  // entries at/after the insertion point: walk right while minX still fits
+  // inside the view's right edge
+  for (let k = insertAt; k < renderBoxesByMinX.length; k++) {
+    const c = renderBoxesByMinX[k];
+    if (c.minX > viewMaxX) break;
+    candidates.push(c);
+  }
+  // entries before the insertion point can still overlap the view on the
+  // left edge (their minX is less than viewMinX but their maxX might still
+  // be inside, or past, it) — walk left while maxX still reaches the view
+  for (let k = insertAt - 1; k >= 0; k--) {
+    const c = renderBoxesByMinX[k];
+    if (c.maxX < viewMinX) break;
+    candidates.push(c);
+  }
+
+  return candidates
+    .filter(c => c.minY <= viewMaxY && c.maxY >= viewMinY)
+    .map(c => renderBoxes[c.i]);
+}
+
+// arena play-field size as reported by the server, resolved once at load and
+// read every frame by drawArenaBorder/the clip step in drawGrid. Same
+// resolved-once-at-load pattern as renderBoxes above — null until the
+// ARENA_SIZE fetch below resolves.
+let arenaSize = null;
+
 // combines box instances with the dimensions table into a flat, render-ready
 // array. Kept as its own function (rather than inlined into onClientReady)
 // so it's easy to re-run later if box data ever becomes something that CAN
@@ -76,13 +146,17 @@ onClientReady(async () => {
   });
 
   // fetched in parallel — neither depends on the other, no reason to
-  // serialize two independent round-trips
-  const [boxes, dimensions] = await Promise.all([
+  // serialize independent round-trips
+  const [boxes, dimensions, fetchedArenaSize] = await Promise.all([
     requestData('BOXES', 'once'),
     requestData('BOX_DIMENSIONS', 'once'),
+    requestData('ARENA_SIZE', 'once'),
   ]);
   renderBoxes = await bakeRenderBoxes(boxes, dimensions);
+  buildRenderBoxIndex();
+  arenaSize = fetchedArenaSize;
   console.log('[client] baked render boxes:', renderBoxes);
+  console.log('[client] arena size:', arenaSize);
 });
 
 // btn-play sends JOIN_REQUEST exactly once, whenever the player actually
@@ -180,7 +254,7 @@ function updateCameraFollow(dt) {
 // instead of a visible snap. See predictPlayerPosition() below.
 
 const PLAYER_RADIUS = 1; // world units
-const PLAYER_BORDER_PX = 1;
+const PLAYER_BORDER_PX = 2;
 const CORRECTION_DECAY_MS = 150; // how long a position correction takes to fully absorb
 const MAX_CORRECTION_MAGNITUDE = 50; // world units — safety clamp, see correction comment below
 
@@ -225,30 +299,84 @@ function getUnitPixelSize() {
   return Math.max(canvas.width / 60, 15);
 }
 
+// world-space corners of the arena's playable interior (i.e. inside the
+// border, matching where drawArenaBorder's inset stroke sits) — returns null
+// if arenaSize hasn't resolved yet, same not-ready convention as renderBoxes
+function getArenaInteriorWorldRect() {
+  if (!arenaSize) return null;
+  return {
+    minX: -arenaSize.width / 2,
+    maxX: arenaSize.width / 2,
+    minY: -arenaSize.height / 2,
+    maxY: arenaSize.height / 2,
+  };
+}
+
+// clips all subsequent drawing to the arena's screen-space rectangle, for
+// the duration of fn. Used to give grid lines and boxes a hard "picture
+// frame" cutoff at the arena edge — this clip is defined in WORLD space and
+// converted through worldToScreen, so it stays correct under camera motion,
+// unlike a canvas-space clip which would have to be recomputed by hand every
+// time the camera moved.
+function withArenaClip(fn) {
+  const rect = getArenaInteriorWorldRect();
+  if (!rect) {
+    fn(); // arena size not loaded yet — draw unclipped rather than draw nothing
+    return;
+  }
+
+  const topLeft = worldToScreen(rect.minX, rect.minY);
+  const bottomRight = worldToScreen(rect.maxX, rect.maxY);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(
+    Math.min(topLeft.x, bottomRight.x),
+    Math.min(topLeft.y, bottomRight.y),
+    Math.abs(bottomRight.x - topLeft.x),
+    Math.abs(bottomRight.y - topLeft.y)
+  );
+  ctx.clip();
+  fn();
+  ctx.restore();
+}
+
 function drawGrid() {
   const unitSize = getUnitPixelSize();
 
+  // full-canvas background fill happens OUTSIDE the arena clip — this is
+  // the "typical background color" visible past the frame edge, and it must
+  // stay full-canvas regardless of arena size/position so there's never an
+  // unpainted gap between the frame and the screen edge
   ctx.fillStyle = getBackgroundColor();
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  ctx.strokeStyle = getGridlineColor();
-  ctx.lineWidth = 1;
+  withArenaClip(() => {
+    ctx.strokeStyle = getGridlineColor();
+    ctx.lineWidth = 1;
 
-  const centerX = canvas.width / 2;
-  const centerY = canvas.height / 2;
-  const offsetX = centerX - (camera.renderpos.x * unitSize) % unitSize;
-  const offsetY = centerY - (camera.renderpos.y * unitSize) % unitSize;
+    // rounded for the same reason worldToScreen rounds its output — see that
+    // function's comment. Gridlines don't go through worldToScreen (they're
+    // built directly from a repeating offset, not per-point world
+    // coordinates), so they need the same snap applied here explicitly or
+    // they'd "flex" independently of, and inconsistently with, everything
+    // that does go through worldToScreen.
+    const centerX = Math.round(canvas.width / 2);
+    const centerY = Math.round(canvas.height / 2);
+    const offsetX = centerX - Math.round(camera.renderpos.x * unitSize) % unitSize;
+    const offsetY = centerY - Math.round(camera.renderpos.y * unitSize) % unitSize;
 
-  ctx.beginPath();
-  for (let x = offsetX % unitSize; x < canvas.width; x += unitSize) {
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, canvas.height);
-  }
-  for (let y = offsetY % unitSize; y < canvas.height; y += unitSize) {
-    ctx.moveTo(0, y);
-    ctx.lineTo(canvas.width, y);
-  }
-  ctx.stroke();
+    ctx.beginPath();
+    for (let x = offsetX % unitSize; x < canvas.width; x += unitSize) {
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, canvas.height);
+    }
+    for (let y = offsetY % unitSize; y < canvas.height; y += unitSize) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(canvas.width, y);
+    }
+    ctx.stroke();
+  });
 }
 
 function screenToWorld(screenX, screenY) {
@@ -259,11 +387,25 @@ function screenToWorld(screenX, screenY) {
   };
 }
 
+// Rounded to whole device pixels before returning. worldToScreen is used
+// ONLY for drawing (grid clip rect, boxes, arena border, player) — never for
+// input math, which goes through screenToWorld instead and stays
+// unsnapped/exact. Without this rounding, a continuously-moving camera
+// means every one of those draw positions lands on a different fractional
+// pixel offset every frame; canvas antialiases thin strokes (the arena
+// border, box borders, gridlines) differently depending on exactly where
+// that fraction falls, which is what reads as the border "flexing" while
+// panning — it's not actually moving, it's re-antialiasing to a slightly
+// different sub-pixel position every frame. Rounding once, here, means
+// every caller that draws the same world point in the same frame (e.g. a
+// box's border relative to its own fill) still agrees with itself, since
+// they all go through this same rounding rather than each accumulating
+// their own independent fractional drift.
 function worldToScreen(worldX, worldY) {
   const unitSize = getUnitPixelSize();
   return {
-    x: canvas.width / 2 + (worldX - camera.renderpos.x) * unitSize,
-    y: canvas.height / 2 + (worldY - camera.renderpos.y) * unitSize,
+    x: Math.round(canvas.width / 2 + (worldX - camera.renderpos.x) * unitSize),
+    y: Math.round(canvas.height / 2 + (worldY - camera.renderpos.y) * unitSize),
   };
 }
 
@@ -292,39 +434,113 @@ function getBoxBorderColor() {
 // Boxes are axis-aligned (rotation locked to 0°/90° server-side), so this is
 // plain rect drawing in screen space — no canvas rotation transform needed,
 // same reasoning the server used to justify plain AABB collision math.
+//
+// Wrapped in withArenaClip (same helper drawGrid uses) so a box straddling
+// or sitting outside the arena boundary gets cut off at the frame edge
+// rather than drawing into the outside-background area. As of server.js's
+// spawnBoxes rework, boxes are guaranteed to spawn fully inside the arena
+// interior already, so in practice this clip mostly guards against future
+// changes (e.g. destructible/movable boxes) rather than papering over
+// today's spawn logic.
+//
+// Boxes are also culled to the current view rect before this loop even
+// runs (see getViewWorldRect/getVisibleBoxes above) — the clip below still
+// matters for boxes that are IN view but straddle the arena edge.
+// world-space view rect currently visible on screen, expanded by margin so
+// a box just outside the frustum doesn't visibly pop in/out right at the
+// edge (its far corner can still be up to half a box-width past what's
+// nominally "visible" before it's actually fully offscreen). Recomputed
+// fresh each call rather than cached — cheap arithmetic, and it has to
+// track the camera every frame anyway.
+const VIEW_CULL_MARGIN = 5; // world units, comfortably more than half the widest box (2.5)
+
+function getViewWorldRect() {
+  const unitSize = getUnitPixelSize();
+  const halfWidthWorld = (canvas.width / 2) / unitSize;
+  const halfHeightWorld = (canvas.height / 2) / unitSize;
+
+  return {
+    minX: camera.renderpos.x - halfWidthWorld - VIEW_CULL_MARGIN,
+    maxX: camera.renderpos.x + halfWidthWorld + VIEW_CULL_MARGIN,
+    minY: camera.renderpos.y - halfHeightWorld - VIEW_CULL_MARGIN,
+    maxY: camera.renderpos.y + halfHeightWorld + VIEW_CULL_MARGIN,
+  };
+}
+
 function drawBoxes() {
   if (!renderBoxes) return; // not baked yet (fetch + bakeRenderBoxes hasn't resolved)
 
+  withArenaClip(() => {
+    const unitSize = getUnitPixelSize();
+    const borderPx = BOX_BORDER_THICKNESS_UNITS * unitSize;
+    const borderColor = getBoxBorderColor();
+
+    const view = getViewWorldRect();
+    const visibleBoxes = getVisibleBoxes(view.minX, view.maxX, view.minY, view.maxY);
+
+    for (const box of visibleBoxes) {
+      const isSquare = box.width === box.height;
+      const topLeft = worldToScreen(box.x - box.width / 2, box.y - box.height / 2);
+      const wPx = box.width * unitSize;
+      const hPx = box.height * unitSize;
+
+      // fill first, full box size — this is the hitbox, unaffected by border
+      ctx.fillStyle = isSquare ? BOX_FILL_COLOR_SQUARE : BOX_FILL_COLOR_SKINNY;
+      ctx.fillRect(topLeft.x, topLeft.y, wPx, hPx);
+
+      // border second, drawn INSET by half its own width so the stroke's
+      // outer edge lands exactly on the hitbox boundary. ctx.strokeRect
+      // centers the stroke on the path it's given — half the lineWidth draws
+      // outside that path, half inside — so stroking the box's own edges at
+      // full lineWidth would push borderPx/2 outside the hitbox on every
+      // side. Shrinking the stroked rect inward by borderPx/2 on each edge
+      // cancels that outward half, keeping the whole border within bounds.
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = borderPx;
+      ctx.strokeRect(
+        topLeft.x + borderPx / 2,
+        topLeft.y + borderPx / 2,
+        wPx - borderPx,
+        hPx - borderPx
+      );
+    }
+  });
+}
+
+// --- arena border ---
+// Drawn as a TOP-LEVEL render step (see clientloop) — always on top of grid,
+// boxes, and player, since it's the physical edge of the playable world and
+// nothing should visually read as being in front of it. Reuses
+// getBoxBorderColor's contrast logic (arena border and box borders share the
+// same "always readable against whatever background color is set" goal) and
+// the same inset-stroke technique from drawBoxes, for the same reason: a
+// centered strokeRect would draw half its width outside the arena's actual
+// boundary, which here would mean drawing believable-looking wall INTO the
+// area that's supposed to read as "outside the world, plain background".
+const ARENA_BORDER_THICKNESS_UNITS = 0.5; // game units, must match server.js's ARENA_BORDER_THICKNESS
+
+function drawArenaBorder() {
+  if (!arenaSize) return; // not fetched yet
+
   const unitSize = getUnitPixelSize();
-  const borderPx = BOX_BORDER_THICKNESS_UNITS * unitSize;
-  const borderColor = getBoxBorderColor();
+  const borderPx = ARENA_BORDER_THICKNESS_UNITS * unitSize;
 
-  for (const box of renderBoxes) {
-    const isSquare = box.width === box.height;
-    const topLeft = worldToScreen(box.x - box.width / 2, box.y - box.height / 2);
-    const wPx = box.width * unitSize;
-    const hPx = box.height * unitSize;
+  const topLeft = worldToScreen(-arenaSize.width / 2, -arenaSize.height / 2);
+  const bottomRight = worldToScreen(arenaSize.width / 2, arenaSize.height / 2);
+  const wPx = bottomRight.x - topLeft.x;
+  const hPx = bottomRight.y - topLeft.y;
 
-    // fill first, full box size — this is the hitbox, unaffected by border
-    ctx.fillStyle = isSquare ? BOX_FILL_COLOR_SQUARE : BOX_FILL_COLOR_SKINNY;
-    ctx.fillRect(topLeft.x, topLeft.y, wPx, hPx);
-
-    // border second, drawn INSET by half its own width so the stroke's
-    // outer edge lands exactly on the hitbox boundary. ctx.strokeRect
-    // centers the stroke on the path it's given — half the lineWidth draws
-    // outside that path, half inside — so stroking the box's own edges at
-    // full lineWidth would push borderPx/2 outside the hitbox on every
-    // side. Shrinking the stroked rect inward by borderPx/2 on each edge
-    // cancels that outward half, keeping the whole border within bounds.
-    ctx.strokeStyle = borderColor;
-    ctx.lineWidth = borderPx;
-    ctx.strokeRect(
-      topLeft.x + borderPx / 2,
-      topLeft.y + borderPx / 2,
-      wPx - borderPx,
-      hPx - borderPx
-    );
-  }
+  // inset by half the border width on every side, same reasoning as
+  // drawBoxes' strokeRect call — keeps the border fully within the arena's
+  // actual boundary line rather than straddling it
+  ctx.strokeStyle = getBoxBorderColor();
+  ctx.lineWidth = borderPx;
+  ctx.strokeRect(
+    topLeft.x - borderPx / 2,
+    topLeft.y - borderPx / 2,
+    wPx + borderPx,
+    hPx + borderPx
+  );
 }
 
 // --- raw key/mouse state tracking ---
@@ -391,37 +607,23 @@ window.addEventListener('click', () => {
 // --- returnInputs: set/toggle encoding ---
 
 const INPUT_ORDER = ['left', 'right', 'up', 'down', 'fire', 'reload', 'ability'];
-const SET_INTERVAL_MS = 500;
-
-let setAccumulator = 0;
 let lastInputState = INPUT_ORDER.map(() => false);
 
-function returnInputs(dt) {
+function returnInputs() {
   const currentState = INPUT_ORDER.map(isActionPressed);
-  setAccumulator += dt * 1000;
 
-  let code;
+  let code = 0b10000000; // always a set packet
 
-  if (setAccumulator >= SET_INTERVAL_MS) {
-    setAccumulator %= SET_INTERVAL_MS;
-
-    code = 0b10000000; // leading 1 = set code
-    currentState.forEach((pressed, i) => {
-      if (pressed) code |= (1 << (6 - i));
-    });
-  } else {
-    code = 0b00000000; // leading 0 = toggle code
-    currentState.forEach((pressed, i) => {
-      if (pressed !== lastInputState[i]) code |= (1 << (6 - i));
-    });
-  }
+  currentState.forEach((pressed, i) => {
+    if (pressed) code |= (1 << (6 - i));
+  });
 
   lastInputState = currentState;
   return code;
 }
 
-function sendInputs(dt) {
-  const inputs = returnInputs(dt);
+function sendInputs() {
+  const inputs = returnInputs();
 
   if (inputs !== 0) {
     sendMessage(false, 'PLAYER_INPUTS', save.public.playerID, inputs);
@@ -486,6 +688,7 @@ function clientloop(currentTime, lastTime) {
   drawGrid();
   drawBoxes();
   gameloop(dt);
+  drawArenaBorder();
 
   requestAnimationFrame((t) => clientloop(t, currentTime));
 }
