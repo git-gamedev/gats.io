@@ -790,11 +790,26 @@ const methods = {
   checkDataSubscriptions,
 };
 
-// --- tick loop ---
-async function tick() {
-  for (const key in methods) {
-    await methods[key]();
-  }
-}
+let tickInProgress = false;
+let nextTickTime = performance.now();
 
-setInterval(tick, tickms);
+async function loop() {
+  if (!tickInProgress) {
+    tickInProgress = true;
+    try {
+      for (const key in methods) {
+        await methods[key]();
+      }
+    } finally {
+      tickInProgress = false;
+    }
+  }
+  // else: previous tick still running (e.g. main thread was slow to
+  // respond to pickup-request) — skip this slot rather than starting
+  // an overlapping tick
+
+  nextTickTime += tickms;
+  const delay = Math.max(0, nextTickTime - performance.now());
+  setTimeout(loop, delay);
+}
+loop();
