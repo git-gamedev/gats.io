@@ -7,13 +7,10 @@
 </head>
 <body>
 
-  <!-- full-page canvas, will render the current server's game state (0,0 for now) -->
   <canvas id="game-canvas"></canvas>
 
-  <!-- settings gear, top right, visible on the main menu -->
   <button id="btn-settings" aria-label="Settings">&#9881;</button>
 
-  <!-- start screen UI, max 50% screen width -->
   <div id="ui-area">
     <div id="weapon-select">Weapon selection (large)</div>
     <div id="row2">
@@ -23,7 +20,6 @@
     </div>
   </div>
 
-  <!-- server list menu, hidden until "Servers" is clicked -->
   <div id="menu-overlay" class="overlay hidden">
     <div id="menu" class="panel">
       <div id="server-list">Open servers will list here</div>
@@ -32,7 +28,6 @@
     </div>
   </div>
 
-  <!-- settings menu, hidden until the gear icon is clicked -->
   <div id="settings-overlay" class="overlay hidden">
     <div id="settings-panel" class="panel">
       <h2>Settings</h2>
@@ -59,7 +54,6 @@
     </div>
   </div>
 
-  <!-- host config panel, hidden until "Host Server" is clicked in the server list menu -->
   <div id="host-config-overlay" class="overlay hidden">
     <div id="host-config-panel" class="panel">
       <h2>Host Server</h2>
@@ -68,9 +62,6 @@
         <label for="host-config-max-players">Max players</label>
         <input type="number" id="host-config-max-players" min="1" max="100" value="25">
       </div>
-
-      <!-- future host-configurable settings (fog, allowed weapons, etc.)
-           go here as more .setting-row entries -->
 
       <div id="host-config-actions">
         <button id="btn-host-config-cancel">Cancel</button>
@@ -81,14 +72,17 @@
 
   <canvas id='mini-map' class="hidden"></canvas>
 
-  <!-- stack of temporary notification cards rises here -->
   <div id="card-stack"></div>
 
   <script src="dynamic-save.js"></script>
+  <script src="spatialIndex.js"></script>
   <script src="connection.js"></script>
   <script src="settings.js"></script>
+  <script src="camera.js"></script>
+  <script src="rendering.js"></script>
+  <script src="input.js"></script>
   <script src="cards.js"></script>
   <script src="script.js"></script>
-  <script src="client.js" type="module"></script>
+  <script src="client.js"></script>
 </body>
 </html>

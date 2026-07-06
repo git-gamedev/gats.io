@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Orbit 3D Sandbox</title>
+<style>
+  :root{
+    --bg: #0b0d10;
+    --panel: #14171b;
+    --border: #262b31;
+    --text: #d7dce1;
+    --text-dim: #7b838c;
+    --accent: #5fb3ff;
+    --mono: "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    overflow: hidden;
+  }
+  #wrap {
+    position: relative;
+    width: 100%; height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+  #hud {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    z-index: 2;
+    gap: 12px;
+  }
+  #hud .left { color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+  #hud .stats { display: flex; gap: 16px; }
+  #hud .stats span b { color: var(--text); font-weight: 600; }
+  #edit-stats span b { color: var(--accent); }
+
+  /* Editable stat values: look like the <b> they replace, but signal interactivity */
+  .stat-val {
+    cursor: text;
+    border-radius: 3px;
+    padding: 0 3px;
+    margin: 0 -3px;
+    transition: background 0.12s ease;
+  }
+  .stat-val:hover {
+    background: rgba(95,179,255,0.12);
+  }
+  .stat-input {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--bg);
+    background: var(--accent);
+    border: none;
+    outline: none;
+    border-radius: 3px;
+    padding: 0 4px;
+    margin: 0 -4px;
+    width: 64px;
+    -moz-appearance: textfield;
+  }
+  .stat-input::-webkit-outer-spin-button,
+  .stat-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  #canvasHolder {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+    background: var(--bg);
+  }
+  canvas:active { cursor: grabbing; }
+  body.edit-mode canvas { cursor: ew-resize; }
+  body.edit-mode canvas:active { cursor: ew-resize; }
+  #hint {
+    position: absolute;
+    bottom: 12px;
+    left: 14px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: rgba(20,23,27,0.7);
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    pointer-events: none;
+    line-height: 1.5;
+  }
+  #colorPickerWrap {
+    position: absolute;
+    z-index: 5;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  #colorPickerWrap::before {
+    content: "pick a color, then press → to continue";
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 6px;
+    font-size: 10px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  #colorPicker {
+    width: 48px;
+    height: 32px;
+    border: none;
+    background: none;
+    padding: 0;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <div class="left">orbit3d</div>
+    <div class="stats">
+      <span>yaw <b class="stat-val" id="stat-yaw" data-stat="yaw">0.00</b></span>
+      <span>pitch <b class="stat-val" id="stat-pitch" data-stat="pitch">0.00</b></span>
+      <span>dist <b class="stat-val" id="stat-dist" data-stat="dist">0.00</b></span>
+      <span>shapes <b id="stat-shapes">0</b></span>
+      <span>polys <b id="stat-count">0</b></span>
+    </div>
+    <div class="stats" id="edit-stats" style="display:none;">
+      <span>mode <b id="stat-mode">edit</b></span>
+      <span>type <b id="stat-type">-</b></span>
+      <span>prop <b id="stat-prop">-</b></span>
+      <span>value <b class="stat-val" id="stat-value" data-stat="editvalue">0.00</b></span>
+    </div>
+  </div>
+  <div id="canvasHolder">
+    <canvas id="scene"></canvas>
+    <div id="hint">
+      <span id="hint-orbit">drag to orbit &middot; scroll to zoom &middot; press 1-4 to spawn box/sphere/cylinder/arc &middot; click a stat to type a value</span>
+      <span id="hint-edit" style="display:none;">drag to adjust value &middot; ← → to change property &middot; Enter to commit &middot; Esc to cancel &middot; click value to type it</span>
+    </div>
+    <div id="colorPickerWrap" style="display:none;">
+      <input type="color" id="colorPicker" value="#5fb3ff">
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Canvas / DPI setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById("scene");
+  const ctx = canvas.getContext("2d");
+  const holder = document.getElementById("canvasHolder");
+
+  function resize(){
+    const dpr = window.devicePixelRatio || 1;
+    const rect = holder.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+    canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+    canvas.style.width = rect.width + "px";
+    canvas.style.height = rect.height + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------------------------------------------------------------------
+  // Camera: spherical orbit around (0,0,0), always looking at the origin.
+  //   yaw    - rotation around the world Y (up) axis
+  //   pitch  - rotation up/down, clamped to avoid flipping over the pole
+  //   dist   - distance of the camera from the origin (orthographic "zoom")
+  // ---------------------------------------------------------------------
+  const camera = {
+    yaw: 0,
+    pitch: 0,
+    dist: 12,
+    minDist: 2,
+    maxDist: 200
+  };
+
+  const PITCH_LIMIT = Math.PI / 2 - 0.01;
+
+  function clampPitch(p){
+    return Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, p));
+  }
+  function clampDist(d){
+    return Math.max(camera.minDist, Math.min(camera.maxDist, d));
+  }
+
+  // =======================================================================
+  // DATA-DRIVEN SCENE MODEL
+  //
+  // window.sceneObjects is a plain JSON-serializable array. Each entry:
+  //   { type: "box"|"sphere"|"cylinder"|"arc", args: { <named properties> } }
+  // This is the single source of truth for what gets drawn. The editor below
+  // (1/2/3/4 to spawn, drag/scroll to edit, Enter to commit) just pushes and
+  // mutates entries in this array. A separate render pass (drawSceneFromJSON)
+  // reads this array every frame and dispatches to box()/sphere()/cylinder()/arc().
+  // You can also splice this array directly, or replace it wholesale, from
+  // outside the editor (e.g. window.sceneObjects = [...]) since it's just data.
+  // =======================================================================
+  window.sceneObjects = window.sceneObjects || [];
+
+  // Per-type property walk order + step size + whether the property is an angle
+  // (angles get a finer drag sensitivity since a "reasonable" range is ~2*PI,
+  // while positions/sizes commonly span tens of units).
+  const SHAPE_SCHEMAS = {
+    box: {
+      keys: ["rotx","roty","rotz","posx","posy","posz","width","height","length","color"],
+      defaults: { rotx:0, roty:0, rotz:0, posx:0, posy:0, posz:0, width:1.5, height:1.5, length:1.5, color:"#5fb3ff" },
+      isAngle:  { rotx:true, roty:true, rotz:true },
+      isColor:  { color:true }
+    },
+    sphere: {
+      keys: ["posx","posy","posz","radius","color"],
+      defaults: { posx:0, posy:0, posz:0, radius:1, color:"#ff8a65" },
+      isAngle:  {},
+      isColor:  { color:true }
+    },
+    cylinder: {
+      keys: ["rotx","roty","rotz","posx","posy","posz","radius","height","color"],
+      defaults: { rotx:0, roty:0, rotz:0, posx:0, posy:0, posz:0, radius:0.7, height:2, color:"#66d19e" },
+      isAngle:  { rotx:true, roty:true, rotz:true },
+      isColor:  { color:true }
+    },
+    arc: {
+      keys: ["posx","posy","posz","innerRadius","outerRadius","startAngle","endAngle","color","thickness"],
+      defaults: { posx:0, posy:0, posz:0, innerRadius:0.8, outerRadius:1.4, startAngle:0, endAngle:Math.PI*1.5, color:"#e0c860", thickness:0.15 },
+      isAngle:  { startAngle:true, endAngle:true },
+      isColor:  { color:true }
+    }
+  };
+  const TYPE_BY_KEYNUM = { "1": "box", "2": "sphere", "3": "cylinder", "4": "arc" };
+
+  // Drag sensitivity: how much one pixel of horizontal mouse movement changes
+  // the current property's value. Angles move in fine radian steps; sizes/positions
+  // move in coarser world-unit steps so a modest drag covers a useful range.
+  const ANGLE_DRAG_SENSITIVITY = 0.01;   // radians per pixel
+  const LINEAR_DRAG_SENSITIVITY = 0.02;  // world units per pixel
+
+  const editor = {
+    mode: "orbit",           // "orbit" | "edit"
+    objectIndex: -1,         // index into window.sceneObjects of the object being edited
+    propIndex: 0,            // index into that type's schema.keys
+    dragging: false,
+    dragStartX: 0,
+    dragStartValue: 0
+  };
+
+  function currentSchema(){
+    if (editor.objectIndex < 0) return null;
+    const obj = window.sceneObjects[editor.objectIndex];
+    return obj ? SHAPE_SCHEMAS[obj.type] : null;
+  }
+
+  function currentPropKey(){
+    const schema = currentSchema();
+    if (!schema) return null;
+    return schema.keys[editor.propIndex] || null;
+  }
+
+  function setMode(mode){
+    editor.mode = mode;
+    document.body.classList.toggle("edit-mode", mode === "edit");
+    document.getElementById("edit-stats").style.display = mode === "edit" ? "flex" : "none";
+    document.getElementById("hint-orbit").style.display = mode === "edit" ? "none" : "inline";
+    document.getElementById("hint-edit").style.display = mode === "edit" ? "inline" : "none";
+    if (mode === "orbit") hideColorPicker();
+  }
+
+  function spawnShape(type){
+    const schema = SHAPE_SCHEMAS[type];
+    if (!schema) return;
+    const args = Object.assign({}, schema.defaults); // fresh copy, spawned at world origin per defaults
+    window.sceneObjects.push({ type, args });
+    editor.objectIndex = window.sceneObjects.length - 1;
+    editor.propIndex = 0;
+    setMode("edit");
+    maybeShowColorPickerForCurrentProp();
+    updateEditHud();
+  }
+
+  // Advance/retreat through the property list for the object currently being edited.
+  // Wrapping is intentional: property editing is meant to be revisited freely before
+  // committing with Enter, so stepping past the last property simply loops to the first
+  // (and stepping back from the first loops to the last).
+  function stepProperty(delta){
+    const schema = currentSchema();
+    if (!schema) return;
+    const n = schema.keys.length;
+    editor.propIndex = ((editor.propIndex + delta) % n + n) % n;
+    maybeShowColorPickerForCurrentProp();
+    updateEditHud();
+  }
+
+  function commitEdit(){
+    hideColorPicker();
+    editor.objectIndex = -1;
+    editor.propIndex = 0;
+    setMode("orbit");
+  }
+
+  function cancelEdit(){
+    if (editor.objectIndex >= 0) {
+      window.sceneObjects.splice(editor.objectIndex, 1);
+    }
+    commitEdit();
+  }
+
+  // ---- Color picker popup ----
+  const colorPickerWrap = document.getElementById("colorPickerWrap");
+  const colorPickerInput = document.getElementById("colorPicker");
+
+  function maybeShowColorPickerForCurrentProp(){
+    const schema = currentSchema();
+    const key = currentPropKey();
+    if (!schema || !key || !schema.isColor[key]) { hideColorPicker(); return; }
+    const obj = window.sceneObjects[editor.objectIndex];
+    colorPickerInput.value = obj.args[key] || "#ffffff";
+    // position near the last known cursor location, clamped to stay on-screen
+    const rect = holder.getBoundingClientRect();
+    const px = Math.min(Math.max(lastX - rect.left, 10), rect.width - 60);
+    const py = Math.min(Math.max(lastY - rect.top, 40), rect.height - 50);
+    colorPickerWrap.style.left = px + "px";
+    colorPickerWrap.style.top = py + "px";
+    colorPickerWrap.style.display = "block";
+  }
+  function hideColorPicker(){
+    colorPickerWrap.style.display = "none";
+  }
+  colorPickerInput.addEventListener("input", () => {
+    const key = currentPropKey();
+    if (editor.objectIndex < 0 || !key) return;
+    window.sceneObjects[editor.objectIndex].args[key] = colorPickerInput.value;
+    updateEditHud();
+  });
+  // Prevent the native color input from stealing drag-to-orbit / drag-to-edit gestures.
+  colorPickerWrap.addEventListener("mousedown", (e) => e.stopPropagation());
+  colorPickerWrap.addEventListener("wheel", (e) => e.stopPropagation());
+
+  // ---- HUD readout for edit mode ----
+  const statMode = document.getElementById("stat-mode");
+  const statType = document.getElementById("stat-type");
+  const statProp = document.getElementById("stat-prop");
+  const statValueEl = document.getElementById("stat-value");
+
+  function updateEditHud(){
+    if (editor.mode !== "edit" || editor.objectIndex < 0) return;
+    const obj = window.sceneObjects[editor.objectIndex];
+    const key = currentPropKey();
+    statMode.textContent = "edit";
+    statType.textContent = obj.type;
+    statProp.textContent = key || "-";
+    const val = key ? obj.args[key] : undefined;
+    // Don't clobber an input box the user currently has open on this stat.
+    if (!statValueEl.classList.contains("editing-live")) {
+      statValueEl.textContent = (typeof val === "number") ? val.toFixed(3) : String(val);
+    }
+  }
+
+  // =======================================================================
+  // CLICK-TO-TYPE HUD STAT EDITING
+  // Any element with class "stat-val" and a data-stat attribute can be clicked
+  // to swap its text for a live <input type="number">. Enter or blur commits
+  // the typed value back into the corresponding piece of state (camera.yaw /
+  // camera.pitch / camera.dist, or the currently-edited object's property).
+  // Escape cancels and restores the previous displayed value without applying it.
+  // =======================================================================
+  function isEditableColorProp(){
+    const schema = currentSchema();
+    const key = currentPropKey();
+    return !!(schema && key && schema.isColor[key]);
+  }
+
+  function getStatValue(statName){
+    if (statName === "yaw") return camera.yaw;
+    if (statName === "pitch") return camera.pitch;
+    if (statName === "dist") return camera.dist;
+    if (statName === "editvalue") {
+      if (editor.objectIndex < 0) return null;
+      const key = currentPropKey();
+      if (!key) return null;
+      const obj = window.sceneObjects[editor.objectIndex];
+      return (typeof obj.args[key] === "number") ? obj.args[key] : null;
+    }
+    return null;
+  }
+
+  function setStatValue(statName, value){
+    if (statName === "yaw") { camera.yaw = value; return; }
+    if (statName === "pitch") { camera.pitch = clampPitch(value); return; }
+    if (statName === "dist") { camera.dist = clampDist(value); return; }
+    if (statName === "editvalue") {
+      if (editor.objectIndex < 0) return;
+      const key = currentPropKey();
+      if (!key) return;
+      window.sceneObjects[editor.objectIndex].args[key] = value;
+      return;
+    }
+  }
+
+  function beginStatEdit(el){
+    const statName = el.dataset.stat;
+    // The edit-mode "value" stat only makes sense while actually editing an
+    // object, and only for numeric (non-color) properties — color already
+    // has its own picker UI.
+    if (statName === "editvalue" && (editor.objectIndex < 0 || isEditableColorProp())) return;
+
+    const current = getStatValue(statName);
+    if (current === null || typeof current !== "number") return;
+
+    // Suspend orbit/edit dragging so typing doesn't fight with mouse handlers.
+    dragging = false;
+    editor.dragging = false;
+
+    const decimals = (statName === "editvalue") ? 3 : 2;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.className = "stat-input";
+    input.value = current.toFixed(decimals);
+
+    el.classList.add("editing-live");
+    el.textContent = "";
+    el.appendChild(input);
+    input.focus();
+    input.select();
+
+    // Also stop clicks/mousedowns on the input from bubbling to canvas gestures.
+    input.addEventListener("mousedown", (e) => e.stopPropagation());
+    input.addEventListener("click", (e) => e.stopPropagation());
+
+    function finish(commit){
+      const raw = input.value;
+      const parsed = parseFloat(raw);
+      if (commit && raw.trim() !== "" && !isNaN(parsed)) {
+        setStatValue(statName, parsed);
+      }
+      el.classList.remove("editing-live");
+      // Redraw with fresh (possibly just-committed) values.
+      const latest = getStatValue(statName);
+      el.textContent = (typeof latest === "number") ? latest.toFixed(decimals) : String(latest);
+      if (statName === "editvalue") updateEditHud();
+    }
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      }
+      // Prevent these keystrokes from also being interpreted as the global
+      // 1-4 spawn / arrow-key property-step / Enter-commit shortcuts.
+      e.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  document.querySelectorAll(".stat-val").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (el.classList.contains("editing-live")) return; // already open
+      beginStatEdit(el);
+    });
+    // Keep clicks on the stat from also being treated as canvas mousedowns.
+    el.addEventListener("mousedown", (e) => e.stopPropagation());
+  });
+
+  // ---- Keyboard: 1-4 to spawn, Left/Right arrows to step properties, Enter to commit, Escape to cancel ----
+  window.addEventListener("keydown", (e) => {
+    // Don't hijack keystrokes while a HUD stat input is focused; its own
+    // keydown handler (above) deals with Enter/Escape and stops propagation,
+    // but guard here too in case focus is on some other future input.
+    if (document.activeElement && document.activeElement.tagName === "INPUT") return;
+
+    if (editor.mode === "orbit" && TYPE_BY_KEYNUM[e.key]) {
+      spawnShape(TYPE_BY_KEYNUM[e.key]);
+      return;
+    }
+    if (editor.mode === "edit") {
+      if (e.key === "Enter") { commitEdit(); return; }
+      if (e.key === "Escape") { cancelEdit(); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); stepProperty(1); return; }
+      if (e.key === "ArrowLeft") { e.preventDefault(); stepProperty(-1); return; }
+    }
+  });
+
+  // Mouse drag -> orbit
+  let dragging = false;
+  let lastX = 0, lastY = 0;
+  const DRAG_SENSITIVITY = 0.008;
+
+  canvas.addEventListener("mousedown", (e) => {
+    lastX = e.clientX;
+    lastY = e.clientY;
+    if (editor.mode === "edit") {
+      const key = currentPropKey();
+      const schema = currentSchema();
+      if (!key || (schema && schema.isColor[key])) return; // color step is picker-driven, not drag-driven
+      editor.dragging = true;
+      editor.dragStartX = e.clientX;
+      const obj = window.sceneObjects[editor.objectIndex];
+      editor.dragStartValue = obj.args[key];
+    } else {
+      dragging = true;
+    }
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (editor.mode === "edit") {
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (!editor.dragging) return;
+      const schema = currentSchema();
+      const key = currentPropKey();
+      if (!schema || !key) return;
+      const dx = e.clientX - editor.dragStartX;
+      const sensitivity = schema.isAngle[key] ? ANGLE_DRAG_SENSITIVITY : LINEAR_DRAG_SENSITIVITY;
+      const obj = window.sceneObjects[editor.objectIndex];
+      obj.args[key] = editor.dragStartValue + dx * sensitivity;
+      updateEditHud();
+      return;
+    }
+    if (!dragging) { lastX = e.clientX; lastY = e.clientY; return; }
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    camera.yaw += dx * DRAG_SENSITIVITY;
+    camera.pitch = clampPitch(camera.pitch - dy * DRAG_SENSITIVITY);
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    editor.dragging = false;
+  });
+
+  // touch support (single finger orbit / edit-drag, mirroring mouse behavior)
+  canvas.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) return;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+    if (editor.mode === "edit") {
+      const key = currentPropKey();
+      const schema = currentSchema();
+      if (!key || (schema && schema.isColor[key])) return;
+      editor.dragging = true;
+      editor.dragStartX = e.touches[0].clientX;
+      const obj = window.sceneObjects[editor.objectIndex];
+      editor.dragStartValue = obj.args[key];
+    } else {
+      dragging = true;
+    }
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (e.touches.length !== 1) return;
+    if (editor.mode === "edit") {
+      lastX = e.touches[0].clientX;
+      lastY = e.touches[0].clientY;
+      if (!editor.dragging) return;
+      const schema = currentSchema();
+      const key = currentPropKey();
+      if (!schema || !key) return;
+      const dx = e.touches[0].clientX - editor.dragStartX;
+      const sensitivity = schema.isAngle[key] ? ANGLE_DRAG_SENSITIVITY : LINEAR_DRAG_SENSITIVITY;
+      const obj = window.sceneObjects[editor.objectIndex];
+      obj.args[key] = editor.dragStartValue + dx * sensitivity;
+      updateEditHud();
+      return;
+    }
+    if (!dragging) { lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; return; }
+    const dx = e.touches[0].clientX - lastX;
+    const dy = e.touches[0].clientY - lastY;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+    camera.yaw += dx * DRAG_SENSITIVITY;
+    camera.pitch = clampPitch(camera.pitch - dy * DRAG_SENSITIVITY);
+  }, { passive: true });
+  window.addEventListener("touchend", () => {
+    dragging = false;
+    editor.dragging = false;
+  });
+
+  // Scroll -> zoom (active in both orbit and edit mode; property stepping is
+  // now driven by the Left/Right arrow keys instead, see the keydown handler).
+  // Per spec: "scroll up" zooms OUT (camera farther back, dist increases),
+  //           "scroll down" zooms IN (camera closer, dist decreases).
+  // Standard wheel event convention: scrolling up (away from you) produces
+  // NEGATIVE deltaY; scrolling down (toward you) produces POSITIVE deltaY.
+  const ZOOM_SENSITIVITY = 0.0025;
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    // deltaY < 0 (scroll up)   -> factor > 1 -> dist increases -> zoom OUT. Correct per spec.
+    // deltaY > 0 (scroll down) -> factor < 1 -> dist decreases -> zoom IN.  Correct per spec.
+    const factor = 1 + (-e.deltaY) * ZOOM_SENSITIVITY;
+    camera.dist = clampDist(camera.dist * factor);
+  }, { passive: false });
+
+  // ---------------------------------------------------------------------
+  // Math helpers
+  // ---------------------------------------------------------------------
+  function vec3(x, y, z){ return { x, y, z }; }
+
+  function addV(a, b){ return vec3(a.x + b.x, a.y + b.y, a.z + b.z); }
+  function subV(a, b){ return vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
+  function scaleV(a, s){ return vec3(a.x * s, a.y * s, a.z * s); }
+  function dotV(a, b){ return a.x*b.x + a.y*b.y + a.z*b.z; }
+  function crossV(a, b){
+    return vec3(
+      a.y*b.z - a.z*b.y,
+      a.z*b.x - a.x*b.z,
+      a.x*b.y - a.y*b.x
+    );
+  }
+  function lenV(a){ return Math.sqrt(dotV(a,a)); }
+  function normV(a){
+    const l = lenV(a);
+    if (l < 1e-9) return vec3(0,0,0);
+    return scaleV(a, 1/l);
+  }
+
+  // Rotate a point by intrinsic XYZ Euler angles (rx applied first, then ry, then rz),
+  // matching box(rotx, roty, rotz, ...) semantics: rotate object about its own axes
+  // in X -> Y -> Z order, then translate.
+  function rotateXYZ(p, rx, ry, rz){
+    let { x, y, z } = p;
+    // rotate around X
+    if (rx) {
+      const c = Math.cos(rx), s = Math.sin(rx);
+      const y1 = y*c - z*s;
+      const z1 = y*s + z*c;
+      y = y1; z = z1;
+    }
+    // rotate around Y
+    if (ry) {
+      const c = Math.cos(ry), s = Math.sin(ry);
+      const x1 = x*c + z*s;
+      const z1 = -x*s + z*c;
+      x = x1; z = z1;
+    }
+    // rotate around Z
+    if (rz) {
+      const c = Math.cos(rz), s = Math.sin(rz);
+      const x1 = x*c - y*s;
+      const y1 = x*s + y*c;
+      x = x1; y = y1;
+    }
+    return vec3(x, y, z);
+  }
+
+  // ---------------------------------------------------------------------
+  // Camera transform + orthographic projection
+  // ---------------------------------------------------------------------
+  // Build camera basis vectors (right, up, forward) from yaw/pitch.
+  function getCameraBasis(){
+    const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+    const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+
+    // Camera position on a sphere of radius camera.dist around the origin.
+    const eye = vec3(
+      camera.dist * cp * sy,
+      camera.dist * sp,
+      camera.dist * cp * cy
+    );
+
+    // Forward = direction from eye to target (origin) since camera always looks at (0,0,0).
+    const forward = normV(scaleV(eye, -1));
+    const worldUp = vec3(0, 1, 0);
+    let right = normV(crossV(forward, worldUp));
+    if (lenV(right) < 1e-6) right = vec3(1, 0, 0); // guard for gimbal edge case
+    const up = normV(crossV(right, forward));
+
+    return { eye, forward, right, up };
+  }
+
+  // Transform a world-space point into camera space (x=right, y=up, z=depth-toward-viewer... 
+  // we use z = distance along forward, larger z = farther from camera).
+  function worldToCamera(p, basis){
+    const rel = subV(p, basis.eye);
+    return vec3(
+      dotV(rel, basis.right),
+      dotV(rel, basis.up),
+      dotV(rel, basis.forward)
+    );
+  }
+
+  // Orthographic projection: camera-space (x,y) map directly to screen, scaled by a
+  // fixed pixels-per-unit factor that depends on camera distance (so "zoom" via distance
+  // still visually shrinks/grows the world, like a real orbit camera).
+  let SCALE = 40; // pixels per world unit at dist=1 baseline (tuned by camera.dist in draw)
+
+  function project(camSpacePoint, viewport, basis){
+    // Screen scale is inversely proportional to camera.dist: as the camera moves
+    // farther back (larger dist), the same world-space extent covers fewer pixels.
+    // The constant 10 is just a baseline distance chosen so the default camera.dist
+    // produces a reasonably-sized view; it has no other significance.
+    const s = SCALE * (10 / camera.dist);
+    return {
+      x: viewport.cx + camSpacePoint.x * s,
+      y: viewport.cy - camSpacePoint.y * s, // screen y is flipped
+      depth: camSpacePoint.z
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // Scene object registry
+  // The user's draw loop calls box()/sphere()/cylinder()/arc() every frame.
+  // Each call enqueues a renderable "mesh" (a list of flat-shaded polygons
+  // with a computed depth) into the current frame's queue. At the end of
+  // the frame we depth-sort (painter's algorithm, back to front) and draw.
+  // ---------------------------------------------------------------------
+  let frameQueue = [];
+
+  function pushPolygon(worldVerts, color, strokeColor){
+    // worldVerts: array of {x,y,z} in world space, planar, wound consistently.
+    frameQueue.push({ verts: worldVerts, color, strokeColor });
+  }
+
+  // ---- Color helpers ----
+  function shade(colorStr, amount){
+    // amount in [-1,1], negative darkens, positive lightens. Works on #rrggbb or rgb()/named
+    // by falling back to canvas for parsing.
+    const off = document.createElement("canvas").getContext("2d");
+    off.fillStyle = colorStr;
+    const norm = off.fillStyle; // normalized to #rrggbb or rgba(...)
+    let r, g, b, a = 1;
+    if (norm[0] === "#") {
+      r = parseInt(norm.slice(1,3),16);
+      g = parseInt(norm.slice(3,5),16);
+      b = parseInt(norm.slice(5,7),16);
+    } else {
+      const m = norm.match(/rgba?\(([^)]+)\)/);
+      const parts = m[1].split(",").map(Number);
+      r = parts[0]; g = parts[1]; b = parts[2];
+      if (parts.length > 3) a = parts[3];
+    }
+    function adj(c){
+      if (amount >= 0) return Math.round(c + (255 - c) * amount);
+      return Math.round(c * (1 + amount));
+    }
+    r = Math.max(0, Math.min(255, adj(r)));
+    g = Math.max(0, Math.min(255, adj(g)));
+    b = Math.max(0, Math.min(255, adj(b)));
+    return `rgba(${r},${g},${b},${a})`;
+  }
+
+  // =======================================================================
+  // PRIMITIVE: box(rotx, roty, rotz, posx, posy, posz, width, height, length, color)
+  //   Rotation in radians about the box's own center, applied X then Y then Z.
+  //   width -> local X extent, height -> local Y extent, length -> local Z extent.
+  // =======================================================================
+  function box(rotx, roty, rotz, posx, posy, posz, width, height, length, color){
+    const hw = width/2, hh = height/2, hl = length/2;
+    const center = vec3(posx, posy, posz);
+
+    // 8 local corners
+    const local = [
+      vec3(-hw,-hh,-hl), vec3( hw,-hh,-hl), vec3( hw, hh,-hl), vec3(-hw, hh,-hl), // back face (z-)
+      vec3(-hw,-hh, hl), vec3( hw,-hh, hl), vec3( hw, hh, hl), vec3(-hw, hh, hl)  // front face (z+)
+    ];
+    const world = local.map(p => addV(rotateXYZ(p, rotx, roty, rotz), center));
+
+    // 6 faces as vertex index quads, wound so normal roughly points outward
+    const faces = [
+      { idx: [0,1,2,3], n: vec3(0,0,-1) }, // back
+      { idx: [5,4,7,6], n: vec3(0,0, 1) }, // front
+      { idx: [1,5,6,2], n: vec3(1,0,0)  }, // right
+      { idx: [4,0,3,7], n: vec3(-1,0,0) }, // left
+      { idx: [3,2,6,7], n: vec3(0,1,0)  }, // top
+      { idx: [4,5,1,0], n: vec3(0,-1,0) }, // bottom
+    ];
+
+    for (const f of faces) {
+      const verts = f.idx.map(i => world[i]);
+      // rotate the face normal to world space for simple shading (front/back darkening)
+      const wn = rotateXYZ(f.n, rotx, roty, rotz);
+      pushShadedPolygon(verts, color, wn);
+    }
+  }
+
+  // No lighting system is implemented. This is only a static per-face color tint
+  // based on a fixed reference direction, added so rotated faces stay visually
+  // distinguishable from each other without needing a textured backdrop. It does
+  // not simulate light falloff, shadows, or react to camera position.
+  const FAKE_LIGHT_DIR = normV(vec3(0.4, 0.8, 0.5));
+  function pushShadedPolygon(worldVerts, color, worldNormal){
+    let tint = 0;
+    if (worldNormal) {
+      const n = normV(worldNormal);
+      const d = dotV(n, FAKE_LIGHT_DIR); // -1..1
+      tint = d * 0.22; // subtle
+    }
+    const finalColor = tint !== 0 ? shade(color, tint) : color;
+    pushPolygon(worldVerts, finalColor, "rgba(0,0,0,0.35)");
+  }
+
+  // =======================================================================
+  // PRIMITIVE: sphere(posx, posy, posz, radius, color, [segments])
+  //   Built as a lat/long mesh of quads (triangulated at poles).
+  // =======================================================================
+  function sphere(posx, posy, posz, radius, color, segments){
+    segments = segments || 12;
+    const rings = Math.max(4, segments);
+    const slices = Math.max(6, segments);
+    const center = vec3(posx, posy, posz);
+
+    // generate vertex grid
+    const grid = [];
+    for (let i = 0; i <= rings; i++){
+      const theta = Math.PI * i / rings; // 0..PI (pole to pole)
+      const y = radius * Math.cos(theta);
+      const r = radius * Math.sin(theta);
+      const row = [];
+      for (let j = 0; j <= slices; j++){
+        const phi = 2 * Math.PI * j / slices;
+        const x = r * Math.cos(phi);
+        const z = r * Math.sin(phi);
+        row.push(addV(vec3(x, y, z), center));
+      }
+      grid.push(row);
+    }
+
+    for (let i = 0; i < rings; i++){
+      for (let j = 0; j < slices; j++){
+        const a = grid[i][j];
+        const b = grid[i][j+1];
+        const c = grid[i+1][j+1];
+        const d = grid[i+1][j];
+        // approximate normal from quad center direction (sphere -> normal is just point - center)
+        const quadCenter = scaleV(addV(addV(a,b), addV(c,d)), 0.25);
+        const n = normV(subV(quadCenter, center));
+        if (i === 0) {
+          // Top ring: theta=0 gives r=0, so a and b are both exactly the north pole
+          // point regardless of j. Drop the duplicate and emit a triangle instead.
+          pushShadedPolygon([a, c, d], color, n);
+        } else if (i === rings - 1) {
+          // Bottom ring: same coincidence at the south pole, this time c===d.
+          pushShadedPolygon([a, b, c], color, n);
+        } else {
+          pushShadedPolygon([a, b, c, d], color, n);
+        }
+      }
+    }
+  }
+
+  // =======================================================================
+  // PRIMITIVE: cylinder(rotx, roty, rotz, posx, posy, posz, radius, height, color, [segments])
+  //   Axis is local Y. Rotation applied X then Y then Z about its own center, then translated.
+  // =======================================================================
+  function cylinder(rotx, roty, rotz, posx, posy, posz, radius, height, color, segments){
+    segments = segments || 16;
+    const center = vec3(posx, posy, posz);
+    const hh = height / 2;
+
+    const topLocal = [];
+    const botLocal = [];
+    for (let j = 0; j <= segments; j++){
+      const phi = 2 * Math.PI * j / segments;
+      const x = radius * Math.cos(phi);
+      const z = radius * Math.sin(phi);
+      topLocal.push(vec3(x, hh, z));
+      botLocal.push(vec3(x, -hh, z));
+    }
+    const topWorld = topLocal.map(p => addV(rotateXYZ(p, rotx, roty, rotz), center));
+    const botWorld = botLocal.map(p => addV(rotateXYZ(p, rotx, roty, rotz), center));
+    const topCenter = addV(rotateXYZ(vec3(0,hh,0), rotx, roty, rotz), center);
+    const botCenter = addV(rotateXYZ(vec3(0,-hh,0), rotx, roty, rotz), center);
+
+    const upNormal = normV(rotateXYZ(vec3(0,1,0), rotx, roty, rotz));
+    const downNormal = normV(rotateXYZ(vec3(0,-1,0), rotx, roty, rotz));
+
+    // side quads
+    for (let j = 0; j < segments; j++){
+      const a = topWorld[j], b = topWorld[j+1], c = botWorld[j+1], d = botWorld[j];
+      const localNormal = normV(vec3(Math.cos(2*Math.PI*(j+0.5)/segments), 0, Math.sin(2*Math.PI*(j+0.5)/segments)));
+      const worldNormal = normV(rotateXYZ(localNormal, rotx, roty, rotz));
+      pushShadedPolygon([a,b,c,d], color, worldNormal);
+    }
+    // top fan
+    for (let j = 0; j < segments; j++){
+      pushShadedPolygon([topCenter, topWorld[j], topWorld[j+1]], color, upNormal);
+    }
+    // bottom fan
+    for (let j = 0; j < segments; j++){
+      pushShadedPolygon([botCenter, botWorld[j+1], botWorld[j]], color, downNormal);
+    }
+  }
+
+  // =======================================================================
+  // PRIMITIVE: arc(centerx, centery, centerz, innerRadius, outerRadius, startAngle, endAngle, color, [thickness], [segments])
+  //   Lies flat in the local XZ plane (like a ring/pie-slice segment), centered at the given point.
+  //   startAngle/endAngle in radians, measured around Y axis. thickness is extrusion along Y (default thin).
+  //   If innerRadius is 0, it's a filled pie wedge; otherwise a ring segment (washer slice).
+  // =======================================================================
+  function arc(centerx, centery, centerz, innerRadius, outerRadius, startAngle, endAngle, color, thickness, segments){
+    thickness = (thickness === undefined) ? 0.05 : thickness;
+    segments = segments || 24;
+    const center = vec3(centerx, centery, centerz);
+    const ht = thickness / 2;
+    const span = endAngle - startAngle;
+    const steps = Math.max(1, Math.round(segments * Math.abs(span) / (2*Math.PI)) || 1);
+
+    const outerTop = [], outerBot = [], innerTop = [], innerBot = [];
+    for (let i = 0; i <= steps; i++){
+      const a = startAngle + span * (i/steps);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      outerTop.push(addV(vec3(outerRadius*ca, ht, outerRadius*sa), center));
+      outerBot.push(addV(vec3(outerRadius*ca, -ht, outerRadius*sa), center));
+      innerTop.push(addV(vec3(innerRadius*ca, ht, innerRadius*sa), center));
+      innerBot.push(addV(vec3(innerRadius*ca, -ht, innerRadius*sa), center));
+    }
+
+    const upNormal = vec3(0,1,0), downNormal = vec3(0,-1,0);
+
+    // top face (ring strip)
+    for (let i = 0; i < steps; i++){
+      pushShadedPolygon([outerTop[i], outerTop[i+1], innerTop[i+1], innerTop[i]], color, upNormal);
+    }
+    // bottom face
+    for (let i = 0; i < steps; i++){
+      pushShadedPolygon([innerBot[i], innerBot[i+1], outerBot[i+1], outerBot[i]], color, downNormal);
+    }
+    // outer wall
+    for (let i = 0; i < steps; i++){
+      const a = startAngle + span * ((i+0.5)/steps);
+      const n = vec3(Math.cos(a), 0, Math.sin(a));
+      pushShadedPolygon([outerTop[i], outerBot[i], outerBot[i+1], outerTop[i+1]], color, n);
+    }
+    // inner wall (only meaningful if innerRadius > 0)
+    if (innerRadius > 1e-6) {
+      for (let i = 0; i < steps; i++){
+        const a = startAngle + span * ((i+0.5)/steps);
+        const n = vec3(-Math.cos(a), 0, -Math.sin(a));
+        pushShadedPolygon([innerBot[i], innerTop[i], innerTop[i+1], innerBot[i+1]], color, n);
+      }
+    }
+    // end caps if it's not a full circle. Cap normal points along the tangent
+    // direction at that end of the arc (perpendicular to the radius there).
+    if (Math.abs(span) < 2*Math.PI - 1e-4) {
+      const capNormalStart = vec3(-Math.sin(startAngle), 0, Math.cos(startAngle));
+      const capNormalEnd = vec3(Math.sin(endAngle), 0, -Math.cos(endAngle));
+      pushShadedPolygon([outerTop[0], innerTop[0], innerBot[0], outerBot[0]], color, capNormalStart);
+      pushShadedPolygon([outerBot[steps], innerBot[steps], innerTop[steps], outerTop[steps]], color, capNormalEnd);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Expose primitives globally so a user-supplied draw loop can call them.
+  // ---------------------------------------------------------------------
+  window.box = box;
+  window.sphere = sphere;
+  window.cylinder = cylinder;
+  window.arc = arc;
+
+  // =======================================================================
+  // Single JSON-driven draw function.
+  // Reads window.sceneObjects (an array of { type, args } entries) and calls
+  // the matching primitive for each one, spreading its args in the exact
+  // parameter order that primitive expects. This is the one function that
+  // turns the data list into what's actually rendered on screen; the 1-4
+  // spawn/edit workflow above only ever manipulates the data, never draws
+  // directly.
+  // =======================================================================
+  function drawSceneFromJSON(list){
+    for (const entry of list) {
+      const schema = SHAPE_SCHEMAS[entry.type];
+      if (!schema) { console.warn("Unknown shape type in sceneObjects:", entry.type); continue; }
+      const a = entry.args;
+      switch (entry.type) {
+        case "box":
+          box(a.rotx, a.roty, a.rotz, a.posx, a.posy, a.posz, a.width, a.height, a.length, a.color);
+          break;
+        case "sphere":
+          sphere(a.posx, a.posy, a.posz, a.radius, a.color);
+          break;
+        case "cylinder":
+          cylinder(a.rotx, a.roty, a.rotz, a.posx, a.posy, a.posz, a.radius, a.height, a.color);
+          break;
+        case "arc":
+          arc(a.posx, a.posy, a.posz, a.innerRadius, a.outerRadius, a.startAngle, a.endAngle, a.color, a.thickness);
+          break;
+      }
+    }
+  }
+  window.drawSceneFromJSON = drawSceneFromJSON;
+
+  // ---------------------------------------------------------------------
+  // User draw loop hook.
+  // By default this renders window.sceneObjects every frame via
+  // drawSceneFromJSON — this is what the 1-4 spawn/edit workflow populates.
+  // You can still override window.userDraw yourself to call box/sphere/
+  // cylinder/arc directly (see demoDraw below for a reference example);
+  // doing so replaces the JSON-driven rendering entirely.
+  // ---------------------------------------------------------------------
+  function demoDraw(t){
+    box(0, t*0.4, 0, 0, 0, 0, 2, 2, 2, "#5fb3ff");
+    sphere(3.2, Math.sin(t)*0.6, 0, 0.8, "#ff8a65", 14);
+    cylinder(0, 0, Math.PI/2 * Math.sin(t*0.5), -3.2, 0, 0, 0.6, 2.4, "#66d19e", 16);
+    arc(0, -1.4, 0, 1.2, 1.8, 0, Math.PI*1.4 + Math.sin(t*0.3)*0.4, "#e0c860", 0.15, 32);
+    // ground reference ring
+    arc(0, -1.6, 0, 4, 4.05, 0, Math.PI*2, "#3a3f46", 0.02, 48);
+  }
+  window.demoDraw = demoDraw;
+  window.userDraw = window.userDraw || function(t){ drawSceneFromJSON(window.sceneObjects); };
+
+  // ---------------------------------------------------------------------
+  // Main render loop
+  // ---------------------------------------------------------------------
+  const statYaw = document.getElementById("stat-yaw");
+  const statPitch = document.getElementById("stat-pitch");
+  const statDist = document.getElementById("stat-dist");
+  const statCount = document.getElementById("stat-count");
+  const statShapes = document.getElementById("stat-shapes");
+
+  let startTime = performance.now();
+
+  function frame(now){
+    const t = (now - startTime) / 1000;
+
+    // Reset the per-frame object queue, then let the (possibly user-supplied) draw
+    // callback populate it via box()/sphere()/cylinder()/arc().
+    frameQueue = [];
+    try {
+      window.userDraw(t);
+    } catch (err) {
+      // surface errors without killing the render loop
+      console.error("userDraw error:", err);
+    }
+
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function render(){
+    const rect = holder.getBoundingClientRect();
+    const w = rect.width, h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const basis = getCameraBasis();
+    const viewport = { cx: w/2, cy: h/2 };
+
+    // Project every polygon's vertices, compute average depth for sorting.
+    const projected = [];
+    for (const poly of frameQueue) {
+      const camVerts = poly.verts.map(v => worldToCamera(v, basis));
+      // backface-ish cull-free: we just need average depth. Skip degenerate.
+      let avgDepth = 0;
+      const screenVerts = camVerts.map(cv => {
+        avgDepth += cv.z;
+        return project(cv, viewport, basis);
+      });
+      avgDepth /= camVerts.length;
+      projected.push({ screenVerts, color: poly.color, strokeColor: poly.strokeColor, depth: avgDepth });
+    }
+
+    // Painter's algorithm: farther objects (larger depth along forward axis) drawn first.
+    projected.sort((a, b) => b.depth - a.depth);
+
+    for (const p of projected) {
+      if (p.screenVerts.length < 3) continue;
+      ctx.beginPath();
+      ctx.moveTo(p.screenVerts[0].x, p.screenVerts[0].y);
+      for (let i = 1; i < p.screenVerts.length; i++){
+        ctx.lineTo(p.screenVerts[i].x, p.screenVerts[i].y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = p.color;
+      ctx.fill();
+      if (p.strokeColor) {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = p.strokeColor;
+        ctx.stroke();
+      }
+    }
+
+    // HUD stats — skip stomping any stat currently being hand-typed.
+    if (!statYaw.classList.contains("editing-live")) statYaw.textContent = camera.yaw.toFixed(2);
+    if (!statPitch.classList.contains("editing-live")) statPitch.textContent = camera.pitch.toFixed(2);
+    if (!statDist.classList.contains("editing-live")) statDist.textContent = camera.dist.toFixed(2);
+    statCount.textContent = String(frameQueue.length);
+    statShapes.textContent = String(window.sceneObjects.length);
+  }
+
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
