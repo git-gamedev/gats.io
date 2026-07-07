@@ -1,11 +1,23 @@
 // script.js
-// owns the UI: menu open/close. once the UI is set up, kicks off client.js
-// (canvas + game logic) by calling initClient().
-// note: menuOverlay is already declared as a global in settings.js - reused here.
+// Owns top-level page wiring: the server-list menu open/close buttons, and
+// bootstrapping the game — spinning up server.js as a Worker and connecting
+// it to the main thread over an in-page WebRTC loopback (two RTCPeerConnections
+// wired directly to each other), then handing the resulting channels to
+// connection.js. Once this wiring completes, client.js's game logic can run.
+// Note: menuOverlay is already declared as a global in settings.js - reused here.
 
+// btnServers — the "Servers" button that opens the server-list menu.
 const btnServers = document.getElementById('btn-servers');
+
+// btnClose — the "Close" button that closes the server-list menu.
 const btnClose = document.getElementById('btn-close');
 
+// worker — the Worker instance running server.js, created by the bootstrap
+// IIFE below.
+let worker;
+
+// wire up the server-list menu's open/close buttons, or log an error if any
+// required element is missing
 if (!menuOverlay || !btnServers || !btnClose) {
   console.error('Menu setup failed - missing element:', {
     menuOverlay, btnServers, btnClose
@@ -20,8 +32,10 @@ if (!menuOverlay || !btnServers || !btnClose) {
   });
 }
 
-let worker;
-
+// bootstrap: spin up the server Worker, create a client<->server WebRTC data
+// channel pair via two locally-wired RTCPeerConnections, and hand the
+// resulting channels off to connection.js via setServerChannel/
+// setClientChannel
 (() => {
   worker = new Worker('./server.js');
   attachServerWorker(worker);

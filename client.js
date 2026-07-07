@@ -1,14 +1,116 @@
 // client.js
+// Main game client: connects to the in-page server worker, fetches and
+// bakes static world data (boxes, dimensions, arena size) once at load,
+// tracks this client's own player (predicted position + server corrections),
+// and runs the per-frame client loop that drives the camera, background
+// drawing, and (once a game has started) input sending, prediction, and
+// player/UI drawing.
 
-save.data.writePublic('playerID', 0, 'client.js');
-
-// renderBoxes is the flat, render-ready box array baked once at load (see
-// bakeRenderBoxes below). renderBoxesByMinX is the spatial index over it,
-// built via spatialIndex.js's buildIndexByMinX — same shared logic the
-// server uses for its own box index, see spatialIndex.js's header comment.
+// renderBoxes — the flat, render-ready box array baked once at load (see
+// bakeRenderBoxes below).
 let renderBoxes = null;
+
+// renderBoxesByMinX — the spatial index over renderBoxes, built via
+// spatialIndex.js's buildIndexByMinX — same shared logic the server uses for
+// its own box index, see spatialIndex.js's header comment.
 let renderBoxesByMinX = [];
 
+// arenaSize — the arena's play-field dimensions as fetched from the server,
+// or null until that fetch resolves.
+let arenaSize = null;
+
+// canvas — the main game canvas element.
+const canvas = document.getElementById('game-canvas');
+
+// ctx — the main game canvas's 2D rendering context.
+const ctx = canvas.getContext('2d');
+
+// minimap — the minimap canvas element.
+const minimap = document.getElementById('mini-map');
+
+// minictx — the minimap canvas's 2D rendering context.
+const minictx = minimap.getContext('2d');
+
+// MINIMAP_DOT_RADIUS — radius, in pixels, of the player dot drawn on the
+// minimap.
+const MINIMAP_DOT_RADIUS = 4;
+
+// MINIMAP_DOT_COLOR — fill color of the minimap player dot; matches the main
+// player's fill color.
+const MINIMAP_DOT_COLOR = '#3399ff';
+
+// MINIMAP_BORDER_THICKNESS_PX — thickness, in pixels, of the minimap's own
+// border.
+const MINIMAP_BORDER_THICKNESS_PX = 5;
+
+// PLAYER_RADIUS — this client's player radius, in world units.
+const PLAYER_RADIUS = 1;
+
+// PLAYER_BORDER_PX — thickness, in pixels, of the player circle's border.
+const PLAYER_BORDER_PX = 2;
+
+// CORRECTION_DECAY_MS — how long, in milliseconds, a position correction
+// takes to fully absorb/decay to zero.
+const CORRECTION_DECAY_MS = 150;
+
+// MAX_CORRECTION_MAGNITUDE — safety clamp, in world units, on how large a
+// single position correction is allowed to be (see the POSITION_PLAYER
+// handler below for why).
+const MAX_CORRECTION_MAGNITUDE = 50;
+
+// myPlayer — tracks this client's own player as last reported by the server
+// via POSITION_PLAYER, plus locally-predicted renderPos and a decaying
+// correction absorbing the gap between predicted and authoritative position
+// (see predictPlayerPosition in rendering.js). Camera stays static for now
+// (setTruePos isn't called here) — see the camera comment further below for
+// when/how that gets wired up later.
+const myPlayer = {
+  position:  { x: 0, y: 0 },
+  velocity:  { x: 0, y: 0 },
+  renderPos: { x: 0, y: 0 },
+  correction: { x: 0, y: 0 },
+  timeSinceUpdate: 0
+};
+
+// BOX_FILL_COLOR_SQUARE — fill color for square boxes.
+const BOX_FILL_COLOR_SQUARE = '#8a6d3b';
+
+// BOX_FILL_COLOR_SKINNY — fill color for non-square ("long") boxes.
+const BOX_FILL_COLOR_SKINNY = '#5c6b7a';
+
+// BOX_BORDER_THICKNESS_UNITS — box border thickness, in game units; inset
+// rather than centered (see drawBoxes in rendering.js for why).
+const BOX_BORDER_THICKNESS_UNITS = 0.3;
+
+// VIEW_CULL_MARGIN — extra margin, in world units, added to the view rect
+// used for box culling; comfortably more than half the widest box (2.5).
+const VIEW_CULL_MARGIN = 5;
+
+// ARENA_BORDER_THICKNESS_UNITS — arena border thickness, in game units; must
+// match server.js's ARENA_BORDER_THICKNESS.
+const ARENA_BORDER_THICKNESS_UNITS = 0.5;
+
+// EMPTY_GAMELOOP — no-op per-frame gameloop, active before a game has
+// started.
+const EMPTY_GAMELOOP = (dt) => { return; };
+
+// TRUE_GAMELOOP — the real per-frame gameloop, active once a game has
+// started: sends inputs, predicts this client's player position, and draws
+// the player, arena border, and minimap.
+const TRUE_GAMELOOP = (dt) => {
+  sendInputs(dt);
+  predictPlayerPosition(dt);
+  drawPlayer();
+  drawArenaBorder();
+  drawMinimap();
+};
+
+// gameloop — the currently active per-frame gameloop function, swapped from
+// EMPTY_GAMELOOP to TRUE_GAMELOOP by startGame.
+let gameloop = EMPTY_GAMELOOP;
+
+// boxAABB — returns a world box's AABB extent, computed from its center
+// position and width/height.
 function boxAABB(box) {
   return {
     minX: box.x - box.width / 2,
@@ -18,12 +120,16 @@ function boxAABB(box) {
   };
 }
 
+// buildRenderBoxIndex — (re)builds renderBoxesByMinX from the current
+// renderBoxes array, using spatialIndex.js's shared buildIndexByMinX.
 function buildRenderBoxIndex() {
   renderBoxesByMinX = buildIndexByMinX(renderBoxes, boxAABB);
 }
 
-let arenaSize = null;
-
+// bakeRenderBoxes — converts the server's plain box array (type/position/
+// rotated only) into the flat, render-ready array drawBoxes expects, by
+// looking up each box's actual { width, height } from the BOX_DIMENSIONS
+// lookup table fetched separately from the server.
 async function bakeRenderBoxes(boxes, dimensions) {
   return boxes.map(box => {
     const entry = dimensions[box.type];
@@ -32,6 +138,38 @@ async function bakeRenderBoxes(boxes, dimensions) {
   });
 }
 
+// startGame — swaps in the real gameloop and hides all menus. Called once
+// the server confirms this client has joined.
+function startGame(playerInfo) {
+  gameloop = TRUE_GAMELOOP;
+  hideAllMenus();
+}
+
+// clientloop — the main per-frame loop, driven by requestAnimationFrame.
+// Settles the camera first (before anything reads camera.renderpos this
+// frame), draws the background grid and world boxes (always, menu or not),
+// then runs whichever gameloop is currently active, and schedules its own
+// next frame.
+function clientloop(currentTime, lastTime) {
+  const dt = (currentTime - lastTime) / 1000;
+
+  updateCameraFollow(dt, myPlayer); // camera settled BEFORE anything reads renderpos this frame
+
+  drawGrid();
+  drawBoxes();
+  gameloop(dt);
+
+  requestAnimationFrame((t) => clientloop(t, currentTime));
+}
+
+// register this client's playerID (currently hardcoded to 0) into save.data
+save.data.writePublic('playerID', 0, 'client.js');
+
+// once the client<->server data channel is open, load world data (boxes,
+// dimensions, arena size) in parallel, bake the render box array and its
+// spatial index, and register handlers for JOIN_RESPONSE (which starts the
+// game) and POSITION_PLAYER (which applies a clamped correction toward the
+// server's authoritative position)
 onClientReady(async () => {
   console.log('[client] connection open, loading world data');
 
@@ -96,18 +234,8 @@ document.getElementById('btn-play').addEventListener('click', () => {
   sendMessage(false, 'JOIN_REQUEST', save.public.playerID);
 });
 
-// =============================================================================
-// 🍽️  MEAT AND POTATOES — the real, keep-building-on-this stuff
-// =============================================================================
-
-
-// --- canvas setup ---
-const canvas = document.getElementById('game-canvas');
-const ctx = canvas.getContext('2d');
-
-const minimap = document.getElementById('mini-map');
-const minictx = minimap.getContext('2d');
-
+// canvas setup: size the main canvas to the window (resizing on window
+// resize) and give the minimap its fixed 200x200 backing resolution
 (canvas_setup = function() {
   function resizeCanvas() {
     canvas.width = window.innerWidth;
@@ -121,70 +249,5 @@ const minictx = minimap.getContext('2d');
   minimap.height = 200;
 })();
 
-const MINIMAP_DOT_RADIUS = 4; // px
-const MINIMAP_DOT_COLOR = '#3399ff'; // matches player fill
-const MINIMAP_BORDER_THICKNESS_PX = 5;
-
-// --- player state + rendering ---
-// myPlayer tracks this client's own player as last reported by the server via
-// POSITION_PLAYER. Camera stays static for now (setTruePos isn't called here)
-// — see the camera comment above for when/how that gets wired up later.
-//
-// correction absorbs the gap between where renderPos had drifted to and
-// where the server says the player actually is, then decays to zero over
-// CORRECTION_DECAY_MS — this is what turns each update into a smooth catch-up
-// instead of a visible snap. See predictPlayerPosition() below.
-
-const PLAYER_RADIUS = 1; // world units
-const PLAYER_BORDER_PX = 2;
-const CORRECTION_DECAY_MS = 150; // how long a position correction takes to fully absorb
-const MAX_CORRECTION_MAGNITUDE = 50; // world units — safety clamp, see correction comment below
-
-const myPlayer = {
-  position:  { x: 0, y: 0 },
-  velocity:  { x: 0, y: 0 },
-  renderPos: { x: 0, y: 0 },
-  correction: { x: 0, y: 0 },
-  timeSinceUpdate: 0
-};
-
-const BOX_FILL_COLOR_SQUARE = '#8a6d3b';
-const BOX_FILL_COLOR_SKINNY = '#5c6b7a'; // grey-blue for non-square boxes
-const BOX_BORDER_THICKNESS_UNITS = 0.3; // game units, see drawBoxes for why this is inset rather than centered
-const VIEW_CULL_MARGIN = 5; // world units, comfortably more than half the widest box (2.5)
-
-const ARENA_BORDER_THICKNESS_UNITS = 0.5; // game units, must match server.js's ARENA_BORDER_THICKNESS
-
-
-// --- game loop ---
-
-function startGame(playerInfo) {
-  gameloop = TRUE_GAMELOOP;
-  hideAllMenus();
-}
-
-
-const EMPTY_GAMELOOP = (dt) => { return; };
-const TRUE_GAMELOOP = (dt) => {
-  sendInputs(dt);
-  predictPlayerPosition(dt);
-  drawPlayer();
-  drawArenaBorder();
-  drawMinimap();
-};
-
-let gameloop = EMPTY_GAMELOOP;
-
-function clientloop(currentTime, lastTime) {
-  const dt = (currentTime - lastTime) / 1000;
-
-  updateCameraFollow(dt, myPlayer); // camera settled BEFORE anything reads renderpos this frame
-
-  drawGrid();
-  drawBoxes();
-  gameloop(dt);
-
-  requestAnimationFrame((t) => clientloop(t, currentTime));
-}
-
+// kick off the main per-frame client loop
 requestAnimationFrame((t) => clientloop(t, 0));

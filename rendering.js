@@ -1,8 +1,12 @@
-//rendering.js
+// rendering.js
+// All canvas drawing and screen/world coordinate conversion for the game
+// client: color utilities, world<->screen transforms, view-rect/arena-clip
+// helpers, client-side position prediction, and the per-frame draw
+// functions for the grid, boxes, arena border, player, and minimap.
 
-//Color Utils ------------- :
-//--------------------------:
-
+// getContrastBorderColor — returns an rgb() string, using perceptual
+// luminance of the given hex color to pick a contrasting grey border color
+// (light border on dark fills, dark border on light fills).
 function getContrastBorderColor(hexColor) {
   const { r, g, b } = hexToRgb(hexColor);
   const grey = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -10,16 +14,18 @@ function getContrastBorderColor(hexColor) {
   return `rgb(${contrast}, ${contrast}, ${contrast})`;
 }
 
+// strokeInsetRect — strokes a rectangle inset by half the border width on
+// every side, so the stroke's outer edge lands exactly on (x, y, w, h)
+// rather than bleeding outside it (see drawBoxes for the full reasoning).
 function strokeInsetRect(ctx, x, y, w, h, borderPx, color) {
   ctx.strokeStyle = color;
   ctx.lineWidth = borderPx;
   ctx.strokeRect(x + borderPx / 2, y + borderPx / 2, w - borderPx, h - borderPx);
 }
 
-
-
-//General Utils ----------- :
-//--------------------------:
+// hideAllMenus — hides every menu overlay, shows the minimap, and hides the
+// main menu UI area and settings gear button. Called once the game actually
+// starts.
 function hideAllMenus() {
   document.getElementById('menu-overlay').classList.add('hidden');
   document.getElementById('settings-overlay').classList.add('hidden');
@@ -29,8 +35,9 @@ function hideAllMenus() {
   document.getElementById('btn-settings').style.display = 'none';
 }
 
-//Game Space -------------- :
-//--------------------------:
+// screenToWorld — converts a screen-space pixel coordinate (canvas-relative)
+// into world-space coordinates, using the camera's render position and the
+// current unit pixel size.
 function screenToWorld(screenX, screenY) {
   const unitSize = getUnitPixelSize();
   return {
@@ -39,6 +46,9 @@ function screenToWorld(screenX, screenY) {
   };
 }
 
+// worldToScreen — converts a world-space coordinate into screen-space pixel
+// coordinates, using the camera's render position and the current unit
+// pixel size.
 function worldToScreen(worldX, worldY) {
   const unitSize = getUnitPixelSize();
   return {
@@ -47,10 +57,16 @@ function worldToScreen(worldX, worldY) {
   };
 }
 
+// getUnitPixelSize — returns how many screen pixels one world unit
+// currently occupies, scaling with canvas width but never shrinking below a
+// floor of 15px per unit.
 function getUnitPixelSize() {
   return Math.max(canvas.width / 60, 15);
 }
 
+// getViewWorldRect — returns the world-space rectangle currently visible on
+// screen, expanded by VIEW_CULL_MARGIN on every side so objects just outside
+// the literal viewport are still considered visible for culling purposes.
 function getViewWorldRect() {
   const unitSize = getUnitPixelSize();
   const halfWidthWorld = (canvas.width / 2) / unitSize;
@@ -64,6 +80,10 @@ function getViewWorldRect() {
   };
 }
 
+// withArenaClip — clips subsequent canvas drawing to the arena's interior
+// world rect (converted to screen space) for the duration of calling `fn`,
+// then restores the canvas state. Draws unclipped if arena size hasn't
+// loaded yet, rather than drawing nothing.
 function withArenaClip(fn) {
   const rect = getArenaInteriorWorldRect();
   if (!rect) {
@@ -87,6 +107,8 @@ function withArenaClip(fn) {
   ctx.restore();
 }
 
+// getArenaInteriorWorldRect — returns the arena's interior world-space rect
+// centered on the origin, or null if arenaSize hasn't been fetched yet.
 function getArenaInteriorWorldRect() {
   if (!arenaSize) return null;
   return {
@@ -97,6 +119,11 @@ function getArenaInteriorWorldRect() {
   };
 }
 
+// predictPlayerPosition — advances myPlayer.renderPos by dead-reckoning from
+// the last authoritative position/velocity plus elapsed time, then applies
+// and decays any pending correction (see CORRECTION_DECAY_MS). Falls back to
+// the last known-good authoritative position if the result is non-finite.
+// Called once per frame before drawing the player.
 function predictPlayerPosition(dt) {
     myPlayer.timeSinceUpdate += dt;
 
@@ -126,9 +153,9 @@ function predictPlayerPosition(dt) {
     myPlayer.correction.y *= decay;
 }
 
-
-//draw functions -----------:
-//--------------------------:
+// drawArenaBorder — draws the arena's outer border, inset by half the
+// border width so it sits fully within the arena's actual boundary line.
+// No-ops if arenaSize hasn't been fetched yet.
 function drawArenaBorder() {
   if (!arenaSize) return; // not fetched yet
 
@@ -153,6 +180,11 @@ function drawArenaBorder() {
   );
 }
 
+// drawBoxes — draws every world box currently within the view rect (queried
+// from the spatial index, clipped to the arena interior). Fills at full box
+// size (the hitbox) then strokes an inset border so the border never
+// extends past the hitbox boundary. No-ops if renderBoxes hasn't been baked
+// yet.
 function drawBoxes() {
   if (!renderBoxes) return; // not baked yet (fetch + bakeRenderBoxes hasn't resolved)
 
@@ -187,7 +219,8 @@ function drawBoxes() {
   });
 }
 
-
+// drawPlayer — draws myPlayer as a filled, bordered circle at its current
+// renderPos, converted to screen space.
 function drawPlayer() {
   const screenPos = worldToScreen(myPlayer.renderPos.x, myPlayer.renderPos.y);
   const radiusPx = PLAYER_RADIUS * getUnitPixelSize();
@@ -201,6 +234,10 @@ function drawPlayer() {
   ctx.stroke();
 }
 
+// drawGrid — fills the full canvas with the background color (outside the
+// arena clip, so it covers the whole screen regardless of arena size), then
+// draws gridlines clipped to the arena interior, snapped to whole pixels so
+// they stay consistent with everything else drawn via worldToScreen.
 function drawGrid() {
   const unitSize = getUnitPixelSize();
 
@@ -239,7 +276,9 @@ function drawGrid() {
   });
 }
 
-
+// drawMinimap — draws the minimap background/border, then plots myPlayer's
+// position within it (scaled by arena size) as a dot, once arena size has
+// loaded.
 function drawMinimap() {
   minictx.clearRect(0, 0, minimap.width, minimap.height);
   minictx.fillStyle = 'rgba(255, 255, 255, 0.4)';

@@ -1,19 +1,38 @@
 // cards.js
-// spawns temporary notification cards that rise up from off screen, sit for a
-// bit, then slide back off and get removed. multiple cards stack bottom-up
+// Spawns temporary notification cards that rise up from off screen, sit for
+// a bit, then slide back off and get removed. Multiple cards stack bottom-up
 // without overlapping, and reflow to close any gap when one is removed.
 
-const CARD_GAP = 8;          // space between stacked cards
-const CARD_BOTTOM_MARGIN = 20; // resting distance from the bottom edge
-const RISE_MS = 500;         // time to rise into place
-const HOLD_MS = 2000;        // time spent fully visible
-const EXIT_MS = 500;         // time to slide back off screen (matches CSS transition)
+// CARD_GAP — space, in pixels, left between stacked cards.
+const CARD_GAP = 8;
 
+// CARD_BOTTOM_MARGIN — resting distance, in pixels, from the bottom edge of
+// the screen to the lowest card in the stack.
+const CARD_BOTTOM_MARGIN = 20;
+
+// RISE_MS — time, in milliseconds, a card takes to rise into its resting
+// place in the stack.
+const RISE_MS = 500;
+
+// HOLD_MS — time, in milliseconds, a card spends fully visible before it
+// starts sliding back off screen.
+const HOLD_MS = 2000;
+
+// EXIT_MS — time, in milliseconds, a card takes to slide back off screen;
+// must match the CSS transition duration on .notif-card.
+const EXIT_MS = 500;
+
+// cardStack — the container element that holds all currently active card
+// elements.
 const cardStack = document.getElementById('card-stack');
-const activeCards = []; // ordered bottom -> top, each entry: { el, height }
 
-// recalculate and apply the resting "bottom" position of every active card
-// so they stack with no gaps and no overlap, from the bottom up.
+// activeCards — ordered bottom -> top list of currently active cards, each
+// entry shaped as { el, height }, used to compute stacking offsets.
+const activeCards = [];
+
+// layoutCards — recalculates and applies the resting "bottom" CSS position
+// of every active card so they stack with no gaps and no overlap, from the
+// bottom of the screen up. Called whenever a card is added or removed.
 function layoutCards() {
   let offset = CARD_BOTTOM_MARGIN;
   for (const card of activeCards) {
@@ -22,6 +41,11 @@ function layoutCards() {
   }
 }
 
+// spawnCard — creates a new notification card element with the given
+// message, animates it rising off screen into its stacked position, holds
+// it visible for HOLD_MS, then slides it back off screen and removes it
+// from the DOM and from activeCards, reflowing the remaining stack
+// afterward.
 function spawnCard(message) {
   const el = document.createElement('div');
   el.className = 'notif-card';

@@ -1,65 +1,47 @@
 // server.js — Worker
+// Runs as a dedicated Worker: owns authoritative game state (players,
+// boxes, spawn points), the data-request protocol's server side
+// (dataProviders/dataSubscriptions), collision resolution (player-vs-box,
+// player-vs-arena-boundary, player-vs-player), and the fixed-timestep tick
+// loop that drives movement, collisions, and outgoing position updates.
 
+// pickupCounter — monotonically increasing counter used to mint unique
+// requestIds for pickupMessages calls.
 let pickupCounter = 0;
+
+// pendingPickups — requestId -> resolve function, tracking in-flight
+// pickupMessages() calls awaiting their batch from the main thread.
 const pendingPickups = new Map();
 
+// player_speed — target movement speed, in world units/second, a player's
+// velocity is eased toward based on held movement inputs.
 const player_speed = 15;
+
+// ground_friction — flat per-tick step size, in world units/second, used to
+// ease a player's velocity toward desiredVelocity.
 const ground_friction = 1;
+
+// tickms — fixed tick duration, in milliseconds (60 ticks/second).
 const tickms = 1000 / 60;
 
-// velocities at or below this are treated as "at rest" for the purposes of
-// deciding whether to report the player as moving (see isMoving in
-// playerMovement). Needed because a wall collision that zeroes velocity
-// gets re-nudged back toward desiredVelocity by ground_friction on the very
-// next tick — against a wall that re-nudge immediately collides again and
-// gets zeroed again, but the single-tick nonzero value in between is a real
-// velocity, not float noise. Without this epsilon, holding a movement key
-// into a wall reads as "moving" on every tick forever, so the
+// MOVING_EPSILON — velocities at or below this are treated as "at rest" for
+// the purposes of deciding whether to report the player as moving (see
+// isMoving in playerMovement). Needed because a wall collision that zeroes
+// velocity gets re-nudged back toward desiredVelocity by ground_friction on
+// the very next tick — against a wall that re-nudge immediately collides
+// again and gets zeroed again, but the single-tick nonzero value in between
+// is a real velocity, not float noise. Without this epsilon, holding a
+// movement key into a wall reads as "moving" on every tick forever, so the
 // isMoving/wasMoving stop-signal never fires and the client never learns to
 // stop dead-reckoning forward off the last velocity it heard about.
 const MOVING_EPSILON = 0.01;
 
-
-(function init() {
-  const isWorker = typeof importScripts === 'function' || typeof WorkerGlobalScope !== 'undefined';
-  if (!isWorker) return;
-  postMessage({ type: 'server-alive' });
-})();
-
-
-
-function sendMessage(type, ...args) {
-  postMessage({ type: 'send', message: { type, args } });
-}
-
-function pickupMessages() {
-  return new Promise((resolve) => {
-    const requestId = pickupCounter++;
-    pendingPickups.set(requestId, resolve);
-    postMessage({ type: 'pickup-request', requestId });
-  });
-}
-
-self.onmessage = ({ data: msg }) => {
-  if (msg.type === 'pickup-response') {
-    pendingPickups.get(msg.requestId)?.(msg.batch ?? []);
-    pendingPickups.delete(msg.requestId);
-  } else if (msg.type === 'data-request') {
-    handleDataRequest(msg.requestId, msg.dataType, msg.mode);
-  } else if (msg.type === 'client-disconnected') {
-    handleClientDisconnected();
-  }
-};
-
-// =============================================================================
-// data request protocol — server side
-// =============================================================================
-//
-// dataProviders is the whitelist of things a client is allowed to request.
-// Adding a new requestable data type means adding one entry here; nothing
-// else in the plumbing needs to change. Each provider is a zero-arg function
-// returning the CURRENT value (not a snapshot) — dataSubscriptions below is
-// what turns "current value" into "value at last check" for change detection.
+// dataProviders — the whitelist of things a client is allowed to request via
+// REQUEST_DATA. Adding a new requestable data type means adding one entry
+// here; nothing else in the plumbing needs to change. Each provider is a
+// zero-arg function returning the CURRENT value (not a snapshot) —
+// dataSubscriptions below is what turns "current value" into "value at last
+// check" for change detection.
 const dataProviders = {
   // Plain box array — { type, position, rotated } only, no baked-in
   // width/height. Dimensions are requested separately via BOX_DIMENSIONS
@@ -104,15 +86,240 @@ const dataProviders = {
   SPAWN_POINTS: () => spawnPoints,
 };
 
-// requestId -> { dataType, lastSentJSON }, one entry per ACTIVE CONTINUOUS
-// subscription only. 'once' requests never get an entry here — they're
-// answered immediately and forgotten. lastSentJSON is a JSON string, not the
-// raw value, so change-detection is a simple string comparison instead of a
-// deep-equal implementation; fine for now given dataProviders' values
-// (arrays/objects of primitives), revisit if a provider needs to return
-// something JSON can't represent (e.g. a Map or a function).
+// dataSubscriptions — requestId -> { dataType, lastSentJSON }, one entry per
+// ACTIVE CONTINUOUS subscription only. 'once' requests never get an entry
+// here — they're answered immediately and forgotten. lastSentJSON is a JSON
+// string, not the raw value, so change-detection is a simple string
+// comparison instead of a deep-equal implementation; fine for now given
+// dataProviders' values (arrays/objects of primitives), revisit if a
+// provider needs to return something JSON can't represent (e.g. a Map or a
+// function).
 const dataSubscriptions = new Map();
 
+// players — playerID -> player state object (position, velocity, aiming,
+// desiredVelocity, firing/reloading/usingAbility flags, wasMoving). The
+// single source of truth for every connected player.
+const players = {};
+
+// --- world boxes ---
+// Two types, rotation locked to 0°/90° so every box is always axis-aligned —
+// this keeps collision plain AABB-vs-circle, no rotated-rect math needed.
+//   square: 5x5, rotation is irrelevant (identical either way)
+//   long:   5x1.5, 'rotated' swaps which axis is the long one
+
+// BOX_TYPE — the two box type identifiers used throughout box logic.
+const BOX_TYPE = { SQUARE: 'square', LONG: 'long' };
+
+// SQUARE_SIZE — side length, in world units, of a square box.
+const SQUARE_SIZE = 5;
+
+// LONG_LENGTH — length, in world units, of a long box's long axis.
+const LONG_LENGTH = 5;
+
+// LONG_THICKNESS — length, in world units, of a long box's short axis.
+const LONG_THICKNESS = 1.5;
+
+// BOX_COUNT — number of boxes spawnBoxes will attempt to place.
+const BOX_COUNT = 1500;
+
+// ARENA_WIDTH / ARENA_HEIGHT — arena play field dimensions, centered on the
+// origin. Not a box in the `boxes` array — it's the hard boundary every
+// player and box lives inside, enforced separately in
+// resolveArenaBoundary() below (see that function for why it reuses the
+// same collision math as resolvePlayerCollisions rather than a position
+// clamp).
+const ARENA_WIDTH = 500;
+const ARENA_HEIGHT = 500;
+
+// ARENA_BORDER_THICKNESS — arena border thickness, in world units; must
+// match client.js's ARENA_BORDER_THICKNESS_UNITS.
+const ARENA_BORDER_THICKNESS = 0.5;
+
+// BOX_SPAWN_MAX_ATTEMPTS — how many attempts spawnBoxes will make to place a
+// single box before giving up on it. Bounded rather than infinite so a
+// pathological combination of BOX_COUNT/arena size/box sizes (i.e.
+// genuinely not enough room to fit another box without overlap) can't hang
+// the tick it runs on — it just spawns fewer boxes than BOX_COUNT and logs
+// how many it dropped.
+const BOX_SPAWN_MAX_ATTEMPTS = 200;
+
+// boxes — the world's box array, filled once by spawnBoxes(). Each entry is
+// { type, position, rotated }.
+const boxes = [];
+
+// MEADOW_SIZE — half-width/half-height, in world units, of a box-free zone
+// centered on the origin, kept clear by spawnBoxes so players always have
+// open space to spawn into and fight in near the arena center.
+const MEADOW_SIZE = 35;
+
+// boxesByMinX — spatial index over `boxes`, sorted by minX, used for
+// broad-phase collision queries (see getCandidateBoxes). Boxes are static
+// after spawnBoxes(), so this is built once (well, twice — see the
+// buildSpatialIndex() call sequence below) and never rebuilt after that.
+// Only the X axis needs to be sorted: binary search narrows hundreds of
+// boxes down to a small handful near the player on X, then a plain linear
+// scan filters that small handful by Y overlap. There's no benefit to also
+// maintaining a Y-sorted array — binary search only works on a sorted axis,
+// and "was near the player on X" isn't a property that's monotonic in
+// Y-order, so a second sorted array can't be binary searched using the X
+// pass's result. Scanning the already-small X result for Y is strictly
+// cheaper than maintaining/searching a second sorted structure.
+let boxesByMinX = [];
+
+// PLAYER_RADIUS — player collision radius, in world units; must match
+// client.js's PLAYER_RADIUS.
+const PLAYER_RADIUS = 1;
+
+// RESTITUTION — collision bounciness factor: 1 = perfectly elastic bounce, 0
+// = velocity fully absorbed along the collision normal.
+const RESTITUTION = 0.5;
+
+// BOX_SEARCH_MARGIN — broad-phase search margin, in world units, added
+// around a player's position when querying boxesByMinX. Must exceed
+// PLAYER_RADIUS + half the widest possible box dimension, or the early-out
+// in getCandidateBoxes can skip a box that's still actually in range.
+// Widest box dimension today is SQUARE_SIZE/LONG_LENGTH = 5, so half-width
+// 2.5 + PLAYER_RADIUS 1 = 3.5 -- 7 leaves comfortable margin. Revisit this
+// constant if a wider box type is ever added.
+const BOX_SEARCH_MARGIN = 7;
+
+// --- player spawn points ---
+// 8 points at even 45° angular intervals around the arena center, sitting
+// at the radius halfway between the center and the edge. "Halfway to the
+// edge" uses the SHORTER of the two arena axes — if width and height ever
+// diverge, using the shorter axis guarantees every spawn point still lands
+// safely inside the arena interior on both axes, rather than a longer axis
+// pushing points outside the interior on the shorter one.
+//
+// Each point gets SPAWN_POINT_MAX_ATTEMPTS tries to land clear of every box.
+// Every attempt except the last jitters around the ideal angle/radius
+// slightly (a retry that re-checked the exact same spot would always get
+// the exact same answer, so there'd be no point retrying at all) — the
+// FINAL attempt gives up on jittering, snaps back to the exact ideal
+// point, and instead deletes whatever boxes are still in the way. This
+// guarantees every spawn point ends up usable, and guarantees it stays
+// close to its intended even-interval position rather than drifting
+// wherever the last jitter attempt happened to land.
+
+// SPAWN_POINT_COUNT — number of spawn points to place around the arena.
+const SPAWN_POINT_COUNT = 8;
+
+// SPAWN_POINT_MAX_ATTEMPTS — attempts per spawn point before giving up on
+// jittering and forcing the point clear (see comment above).
+const SPAWN_POINT_MAX_ATTEMPTS = 10;
+
+// SPAWN_POINT_RADIUS — the spawn circle's own radius (not its distance from
+// arena center), used when testing for box overlap.
+const SPAWN_POINT_RADIUS = PLAYER_RADIUS * 2;
+
+// SPAWN_POINT_JITTER — max random per-axis offset, in world units, applied
+// on non-final spawn point placement attempts.
+const SPAWN_POINT_JITTER = 3;
+
+// spawnPoints — [{ x, y }, ...], filled once by spawnSpawnPoints().
+const spawnPoints = [];
+
+// INPUT_ORDER — canonical bit order of the 7 tracked actions; must match the
+// bit order client.js's INPUT_ORDER packs input.js's returnInputs code in.
+const INPUT_ORDER = ['left', 'right', 'up', 'down', 'fire', 'reload', 'ability'];
+
+// msgHandler — inbound message type -> handler function, dispatched from
+// the methods.messages tick step below.
+const msgHandler = {
+  JOIN_REQUEST: (msg) => {
+    const playerPrimitive = formPlayerPrimitive();
+    const spawn = getRandomSpawnPoint();
+    playerPrimitive.position = { x: spawn.x, y: spawn.y };
+    players[msg.playerID] = structuredClone(playerPrimitive);
+    console.log(`[server] playerID ${msg.playerID} has joined at spawn point (${spawn.x.toFixed(1)}, ${spawn.y.toFixed(1)})!`);
+    sendMessage('JOIN_RESPONSE', msg.playerID, players[msg.playerID]);
+  },
+  LEAVE_REQUEST: (msg) => {
+    const existed = msg.playerID in players;
+    delete players[msg.playerID];
+    sendMessage('LEAVE_RESPONSE', msg.playerID, true);
+  },
+  PLAYER_INPUTS: (msg) => {
+    const player = players[msg.playerID];
+    if (!player) return; // inputs arrived before JOIN_REQUEST was processed, or after LEAVE
+
+    const inputs = decodeInputs(msg.inputs);
+
+    const dx = Number(inputs.right) - Number(inputs.left);
+    const dy = Number(inputs.up) - Number(inputs.down);
+    const scale = (dx !== 0 && dy !== 0) ? player_speed / Math.SQRT2 : player_speed;
+
+    player.desiredVelocity = { x: dx * scale, y: dy * -scale };
+
+    player.firing = inputs.fire;
+    player.reloading = inputs.reload;
+    player.usingAbility = inputs.ability;
+  },
+  PLAYER_AIM: (msg) => {
+    const player = players[msg.playerID];
+    if (!player) return;
+    player.aiming = msg.position;
+  },
+};
+
+// methods — the ordered list of per-tick steps run by loop(). Each is called
+// with no arguments, in object-key order, once per tick.
+const methods = {
+  async messages() {
+    const messages = await pickupMessages();
+    for (const msg of messages) {
+      if (msg.type in msgHandler) msgHandler[msg.type](msg);
+    }
+  },
+  playerMovement,
+  bulletMovement() {/*leave empty for now*/},
+  playerAbilities() {/*leave empty for now*/},
+  playerCollisions() {
+    resolveAllPlayerPairCollisions();
+    for (const playerID in players) {
+      resolvePlayerCollisions(players[playerID]);
+      resolveArenaBoundary(players[playerID]);
+    }
+  },
+  bulletCollisions() {/*leave empty for now*/},
+  playerFiring() {/*leave empty for now*/},
+  playerReloading() {/*leave empty for now*/},
+  checkDataSubscriptions,
+};
+
+// tickInProgress — true while a tick's methods are currently running; used
+// by loop() to skip starting an overlapping tick if the previous one hasn't
+// finished yet.
+let tickInProgress = false;
+
+// nextTickTime — the performance.now() timestamp the next tick is scheduled
+// to run at, advanced by tickms every loop() call regardless of how long the
+// tick itself took.
+let nextTickTime = performance.now();
+
+// sendMessage — the worker-side send API: posts a 'send' message up to the
+// main thread, which relays it over the real server channel (see
+// connection.js's attachServerWorker).
+function sendMessage(type, ...args) {
+  postMessage({ type: 'send', message: { type, args } });
+}
+
+// pickupMessages — requests the current batch of pending inbound messages
+// from the main thread (via a 'pickup-request'/'pickup-response' round
+// trip) and returns a Promise resolving with that batch.
+function pickupMessages() {
+  return new Promise((resolve) => {
+    const requestId = pickupCounter++;
+    pendingPickups.set(requestId, resolve);
+    postMessage({ type: 'pickup-request', requestId });
+  });
+}
+
+// handleDataRequest — services one REQUEST_DATA from the client: looks up
+// the matching provider in dataProviders, then either answers immediately
+// (mode 'once') or registers a change-tracked subscription and sends the
+// first value immediately (mode 'continuous'). Warns and no-ops on an
+// unknown dataType or mode.
 function handleDataRequest(requestId, dataType, mode) {
   const provider = dataProviders[dataType];
   if (!provider) {
@@ -135,8 +342,8 @@ function handleDataRequest(requestId, dataType, mode) {
   console.warn(`[server] REQUEST_DATA with unknown mode: ${mode}`);
 }
 
-// called once per tick (see checkDataSubscriptions in the methods list
-// below): re-fetches every active continuous subscription's current value
+// checkDataSubscriptions — called once per tick (see the methods list
+// above): re-fetches every active continuous subscription's current value
 // and pushes only if it differs from what was last sent.
 function checkDataSubscriptions() {
   for (const [requestId, sub] of dataSubscriptions) {
@@ -152,51 +359,19 @@ function checkDataSubscriptions() {
   }
 }
 
-// This worker currently serves exactly one client (see the single-channel
-// architecture in connection.js), so "the client disconnected" means "every
-// subscription is now stale" — clear all of them rather than tracking which
-// requestId belonged to which client.
+// handleClientDisconnected — clears every active data subscription. This
+// worker currently serves exactly one client (see the single-channel
+// architecture in connection.js), so "the client disconnected" means
+// "every subscription is now stale" — clear all of them rather than
+// tracking which requestId belonged to which client.
 function handleClientDisconnected() {
   console.log(`[server] client disconnected, clearing ${dataSubscriptions.size} data subscription(s)`);
   dataSubscriptions.clear();
 }
 
-
-const players = {};
-
-// --- world boxes ---
-// Two types, rotation locked to 0°/90° so every box is always axis-aligned —
-// this keeps collision plain AABB-vs-circle, no rotated-rect math needed.
-//   square: 5x5, rotation is irrelevant (identical either way)
-//   long:   5x1.5, 'rotated' swaps which axis is the long one
-
-const BOX_TYPE = { SQUARE: 'square', LONG: 'long' };
-const SQUARE_SIZE = 5;
-const LONG_LENGTH = 5;
-const LONG_THICKNESS = 1.5;
-
-const BOX_COUNT = 1500;
-
-// arena play field, centered on the origin. Not a box in the `boxes` array —
-// it's the hard boundary every player and box lives inside, enforced
-// separately in resolveArenaBoundary() below (see that function for why it
-// reuses the same collision math as resolvePlayerCollisions rather than a
-// position clamp).
-const ARENA_WIDTH = 500;
-const ARENA_HEIGHT = 500;
-const ARENA_BORDER_THICKNESS = 0.5; // must match client.js's ARENA_BORDER_THICKNESS_UNITS
-
-// how many attempts spawnBoxes will make to place a single box before
-// giving up on it. Bounded rather than infinite so a pathological
-// combination of BOX_COUNT/arena size/box sizes (i.e. genuinely not enough
-// room to fit another box without overlap) can't hang the tick it runs on —
-// it just spawns fewer boxes than BOX_COUNT and logs how many it dropped.
-const BOX_SPAWN_MAX_ATTEMPTS = 200;
-
-const boxes = [];
-
-// returns this box's actual footprint given its type/rotation — the only
-// place collision code should ever need to know box dimensions from.
+// getBoxDimensions — returns this box's actual footprint given its
+// type/rotation — the only place collision code should ever need to know
+// box dimensions from.
 function getBoxDimensions(box) {
   if (box.type === BOX_TYPE.SQUARE) {
     return { width: SQUARE_SIZE, height: SQUARE_SIZE };
@@ -207,22 +382,22 @@ function getBoxDimensions(box) {
     : { width: LONG_LENGTH, height: LONG_THICKNESS };
 }
 
-// AABB-vs-AABB overlap test for two candidate extents — plain rect
-// intersection, no penetration depth needed here since a spawn candidate
-// that overlaps at all just gets thrown away and re-rolled rather than
-// depenetrated.
+// aabbOverlap — AABB-vs-AABB overlap test for two candidate extents — plain
+// rect intersection, no penetration depth needed here since a spawn
+// candidate that overlaps at all just gets thrown away and re-rolled rather
+// than depenetrated.
 function aabbOverlap(a, b) {
   return a.minX < b.maxX && a.maxX > b.minX &&
          a.minY < b.maxY && a.maxY > b.minY;
 }
 
-// picks a random position + extent for a box of the given width/height,
-// fully inside the arena's playable interior (i.e. inset by the arena
-// border thickness, same interior the player boundary uses) so a box can
-// never spawn straddling or outside the wall — this is the "spawn within
-// bounds of whatever sized arena is chosen" half of the fix, since it reads
-// ARENA_WIDTH/ARENA_HEIGHT directly instead of a separate, disconnected
-// world-extent constant.
+// randomBoxExtent — picks a random position + extent for a box of the given
+// width/height, fully inside the arena's playable interior (i.e. inset by
+// the arena border thickness, same interior the player boundary uses) so a
+// box can never spawn straddling or outside the wall — this is the "spawn
+// within bounds of whatever sized arena is chosen" half of the fix, since it
+// reads ARENA_WIDTH/ARENA_HEIGHT directly instead of a separate,
+// disconnected world-extent constant.
 function randomBoxExtent(width, height) {
   const halfW = ARENA_WIDTH / 2 - ARENA_BORDER_THICKNESS;
   const halfH = ARENA_HEIGHT / 2 - ARENA_BORDER_THICKNESS;
@@ -248,18 +423,15 @@ function randomBoxExtent(width, height) {
   };
 }
 
-// spawns BOX_COUNT boxes, each retried against every box already placed so
-// far until it lands somewhere non-overlapping (or BOX_SPAWN_MAX_ATTEMPTS
-// runs out, in which case that box is skipped rather than spawned into
-// something else — see BOX_SPAWN_MAX_ATTEMPTS comment above). Checked
-// against the growing `placedExtents` array directly (plain O(n) scan per
-// attempt) rather than the boxesByMinX spatial index below, since that
-// index isn't built until AFTER spawnBoxes finishes (buildSpatialIndex()
+// spawnBoxes — spawns BOX_COUNT boxes, each retried against every box
+// already placed so far until it lands somewhere non-overlapping (or
+// BOX_SPAWN_MAX_ATTEMPTS runs out, in which case that box is skipped rather
+// than spawned into something else — see BOX_SPAWN_MAX_ATTEMPTS comment
+// above). Checked against the growing `placedExtents` array directly (plain
+// O(n) scan per attempt) rather than the boxesByMinX spatial index, since
+// that index isn't built until AFTER spawnBoxes finishes (buildSpatialIndex()
 // runs once, on static post-spawn data) and n stays small (BOX_COUNT-sized)
 // here regardless.
-
-const MEADOW_SIZE = 35;
-
 function spawnBoxes() {
   const placedExtents = [];
 
@@ -287,22 +459,7 @@ function spawnBoxes() {
   console.log(`[server] spawned ${boxes.length}/${BOX_COUNT} boxes`);
 }
 
-spawnBoxes();
-
-// --- spatial index for collision broad-phase ---
-// Boxes are static after spawnBoxes(), so this is built once and never
-// rebuilt. Only the X axis needs to be sorted: binary search narrows
-// hundreds of boxes down to a small handful near the player on X, then a
-// plain linear scan filters that small handful by Y overlap. There's no
-// benefit to also maintaining a Y-sorted array — binary search only works
-// on a sorted axis, and "was near the player on X" isn't a property that's
-// monotonic in Y-order, so a second sorted array can't be binary searched
-// using the X pass's result. Scanning the already-small X result for Y is
-// strictly cheaper than maintaining/searching a second sorted structure.
-
-let boxesByMinX = [];
-
-// returns this box's world-space AABB extent
+// getBoxExtent — returns this box's world-space AABB extent.
 function getBoxExtent(box) {
   const { width, height } = getBoxDimensions(box);
   return {
@@ -313,6 +470,8 @@ function getBoxExtent(box) {
   };
 }
 
+// buildSpatialIndex — (re)builds boxesByMinX from the current `boxes`
+// array, sorted ascending by minX.
 function buildSpatialIndex() {
   boxesByMinX = boxes
     .map((box, i) => ({ i, ...getBoxExtent(box) }))
@@ -320,19 +479,9 @@ function buildSpatialIndex() {
   console.log(`[server] spatial index built for ${boxesByMinX.length} boxes`);
 }
 
-buildSpatialIndex();
-
-const PLAYER_RADIUS = 1; // must match client.js's PLAYER_RADIUS
-const RESTITUTION = 0.5; // 1 = perfectly elastic bounce, 0 = velocity fully absorbed along normal
-
-// must exceed PLAYER_RADIUS + half the widest possible box dimension, or
-// the early-out below can skip a box that's still actually in range.
-// Widest box dimension today is SQUARE_SIZE/LONG_LENGTH = 5, so half-width
-// 2.5 + PLAYER_RADIUS 1 = 3.5 -- 7 leaves comfortable margin. Revisit this
-// constant if a wider box type is ever added.
-const BOX_SEARCH_MARGIN = 7;
-
-// index of the first entry in boxesByMinX whose minX is >= px
+// findInsertionIndex — index of the first entry in boxesByMinX whose minX is
+// >= px. Used internally by getCandidateBoxes to locate the starting point
+// for its outward scan.
 function findInsertionIndex(px) {
   let lo = 0, hi = boxesByMinX.length;
   while (lo < hi) {
@@ -343,9 +492,10 @@ function findInsertionIndex(px) {
   return lo;
 }
 
-// broad-phase: binary search X, walk outward from the insertion point until
-// minX exceeds the search margin, then linear-scan that small result for
-// actual X/Y AABB overlap against the player's circle.
+// getCandidateBoxes — broad-phase: binary search X, walk outward from the
+// insertion point until minX exceeds the search margin, then linear-scan
+// that small result for actual X/Y AABB overlap against the player's
+// circle.
 function getCandidateBoxes(px, py) {
   const insertAt = findInsertionIndex(px);
   const xCandidates = [];
@@ -369,9 +519,10 @@ function getCandidateBoxes(px, py) {
   );
 }
 
-// narrow-phase: closest point on the AABB to the circle center. Returns the
-// collision normal (pointing from box surface toward player center) and
-// penetration depth, or null if there's no overlap.
+// circleAABBCollision — narrow-phase: closest point on the AABB to the
+// circle center. Returns the collision normal (pointing from box surface
+// toward player center) and penetration depth, or null if there's no
+// overlap.
 function circleAABBCollision(px, py, radius, extent) {
   const closestX = Math.max(extent.minX, Math.min(px, extent.maxX));
   const closestY = Math.max(extent.minY, Math.min(py, extent.maxY));
@@ -400,42 +551,20 @@ function circleAABBCollision(px, py, radius, extent) {
   return { nx: dx / dist, ny: dy / dist, depth: radius - dist };
 }
 
-// --- player spawn points ---
-// 8 points at even 45° angular intervals around the arena center, sitting
-// at the radius halfway between the center and the edge. "Halfway to the
-// edge" uses the SHORTER of the two arena axes — if width and height ever
-// diverge, using the shorter axis guarantees every spawn point still lands
-// safely inside the arena interior on both axes, rather than a longer axis
-// pushing points outside the interior on the shorter one.
-//
-// Each point gets SPAWN_POINT_MAX_ATTEMPTS tries to land clear of every box.
-// Every attempt except the last jitters around the ideal angle/radius
-// slightly (a retry that re-checked the exact same spot would always get
-// the exact same answer, so there'd be no point retrying at all) — the
-// FINAL attempt gives up on jittering, snaps back to the exact ideal
-// point, and instead deletes whatever boxes are still in the way. This
-// guarantees every spawn point ends up usable, and guarantees it stays
-// close to its intended even-interval position rather than drifting
-// wherever the last jitter attempt happened to land.
-const SPAWN_POINT_COUNT = 8;
-const SPAWN_POINT_MAX_ATTEMPTS = 10;
-const SPAWN_POINT_RADIUS = PLAYER_RADIUS * 2; // spawn circle's own radius, not its distance from center
-const SPAWN_POINT_JITTER = 3; // world units, max random offset per axis on non-final attempts
-
-const spawnPoints = []; // [{ x, y }, ...], filled once by spawnSpawnPoints()
-
-// returns every box whose AABB overlaps a circle of SPAWN_POINT_RADIUS at
-// (x, y). Uses getBoxExtent/circleAABBCollision directly rather than the
-// boxesByMinX spatial index/getCandidateBoxes broad-phase — that index is
-// sized and margined for player-radius queries during the tick loop, and
-// SPAWN_POINT_COUNT (8) is tiny, so a plain scan over all boxes here is
-// simpler and in no way a bottleneck (this only ever runs once, at startup).
+// getBoxesOverlappingCircle — returns every box whose AABB overlaps a circle
+// of `radius` at (x, y). Uses getBoxExtent/circleAABBCollision directly
+// rather than the boxesByMinX spatial index/getCandidateBoxes broad-phase —
+// that index is sized and margined for player-radius queries during the
+// tick loop, and SPAWN_POINT_COUNT (8) is tiny, so a plain scan over all
+// boxes here is simpler and in no way a bottleneck (this only ever runs
+// once, at startup).
 function getBoxesOverlappingCircle(x, y, radius) {
   return boxes.filter(box => circleAABBCollision(x, y, radius, getBoxExtent(box)) !== null);
 }
 
-// spawns SPAWN_POINT_COUNT points evenly around the arena center. See the
-// comment above for the retry/jitter/give-up-and-clear shape.
+// spawnSpawnPoints — spawns SPAWN_POINT_COUNT points evenly around the arena
+// center. See the comment above the SPAWN_POINT_* constants for the
+// retry/jitter/give-up-and-clear shape.
 function spawnSpawnPoints() {
   const spawnRadius = Math.min(ARENA_WIDTH, ARENA_HEIGHT) / 4; // "/4" = halfway from center (/2) to edge
 
@@ -475,30 +604,21 @@ function spawnSpawnPoints() {
   console.log(`[server] placed ${spawnPoints.length} spawn points`, spawnPoints);
 }
 
-spawnSpawnPoints();
-
-// spawnSpawnPoints() above can delete boxes (see its final-attempt
-// give-up path), which shrinks `boxes` after buildSpatialIndex() already
-// ran on the pre-deletion array — so the index has to be rebuilt
-// afterward, or boxesByMinX could hold stale entries pointing at box
-// indices that no longer exist (or worse, now point at a different box
-// that shifted into that slot after splice()).
-buildSpatialIndex();
-
-// picks a uniformly random spawn point — used whenever a player joins.
+// getRandomSpawnPoint — picks a uniformly random spawn point — used
+// whenever a player joins.
 function getRandomSpawnPoint() {
   return spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
 }
 
-// resolves box collisions for one player: each overlapping candidate is
-// depenetrated and bounced individually, in sequence, against the player's
-// position as corrected by the previous box in the same pass. No normal
-// blending — each box's push/bounce is exact for that box, which is what
-// stops a stale or tiny leftover overlap from one box being masked or
-// distorted by another box's normal (the old summed-normal approach could
-// produce a combined push/bounce direction that didn't match any single
-// box's real surface, which is what let a corner overlap keep "bouncing"
-// after the player had visually cleared it).
+// resolvePlayerCollisions — resolves box collisions for one player: each
+// overlapping candidate is depenetrated and bounced individually, in
+// sequence, against the player's position as corrected by the previous box
+// in the same pass. No normal blending — each box's push/bounce is exact
+// for that box, which is what stops a stale or tiny leftover overlap from
+// one box being masked or distorted by another box's normal (the old
+// summed-normal approach could produce a combined push/bounce direction
+// that didn't match any single box's real surface, which is what let a
+// corner overlap keep "bouncing" after the player had visually cleared it).
 function resolvePlayerCollisions(player) {
   const candidates = getCandidateBoxes(player.position.x, player.position.y);
 
@@ -521,17 +641,17 @@ function resolvePlayerCollisions(player) {
   }
 }
 
-// --- arena boundary ---
-// Treats the arena's four edges as collision surfaces, reusing the exact
-// same depenetrate + velocity-reflect approach as resolvePlayerCollisions
-// (see that function's comment for why per-surface resolution, not normal
-// blending). This is deliberate, not a shortcut: a position clamp
-// (`position.x = min(position.x, someLimit)`) can leave velocity pointed
-// into the wall with nothing to zero it, which is the exact class of bug
-// MOVING_EPSILON was added to fix for regular box collisions above — reusing
-// the same normal-based reflect keeps arena walls and boxes behaving
-// identically (including wall-running against either one), rather than
-// introducing a second, differently-behaved boundary mechanism.
+// resolveArenaBoundary — treats the arena's four edges as collision
+// surfaces, reusing the exact same depenetrate + velocity-reflect approach
+// as resolvePlayerCollisions (see that function's comment for why
+// per-surface resolution, not normal blending). This is deliberate, not a
+// shortcut: a position clamp (`position.x = min(position.x, someLimit)`)
+// can leave velocity pointed into the wall with nothing to zero it, which
+// is the exact class of bug MOVING_EPSILON was added to fix for regular box
+// collisions above — reusing the same normal-based reflect keeps arena
+// walls and boxes behaving identically (including wall-running against
+// either one), rather than introducing a second, differently-behaved
+// boundary mechanism.
 //
 // Checked independently per axis (unlike circleAABBCollision, which finds
 // one closest point): a player can only ever be pushed out through ONE
@@ -560,9 +680,10 @@ function resolveArenaBoundary(player) {
   }
 }
 
-// depenetrate along (nx, ny) by depth, then reflect velocity the same way
-// resolvePlayerCollisions does for boxes — nx/ny here point from the wall
-// back toward the arena interior (i.e. the direction the player gets pushed)
+// applyArenaHit — depenetrate along (nx, ny) by depth, then reflect velocity
+// the same way resolvePlayerCollisions does for boxes — nx/ny here point
+// from the wall back toward the arena interior (i.e. the direction the
+// player gets pushed).
 function applyArenaHit(player, depth, nx, ny) {
   player.position.x += nx * depth;
   player.position.y += ny * depth;
@@ -575,16 +696,15 @@ function applyArenaHit(player, depth, nx, ny) {
   }
 }
 
-
+// circleCircleCollision — narrow-phase for two circles of equal radius: same
+// shape as circleAABBCollision (normal + penetration depth, or null), but
+// measured center-to-center instead of center-to-closest-AABB-point.
+//
 // All-pairs check, no spatial index. Player counts are expected to stay in
 // the dozens (unlike boxes, which head into the hundreds), so n*(n-1)/2
 // comparisons per tick is trivial — e.g. 100 players is ~4,950 checks. If
 // player counts ever grow into box-like territory, the same X-binary-search
 // + Y-linear-scan approach used for boxes could be applied here too.
-
-// narrow-phase for two circles of equal radius: same shape as
-// circleAABBCollision (normal + penetration depth, or null), but measured
-// center-to-center instead of center-to-closest-AABB-point.
 function circleCircleCollision(ax, ay, bx, by, radius) {
   const dx = ax - bx;
   const dy = ay - by;
@@ -605,9 +725,10 @@ function circleCircleCollision(ax, ay, bx, by, radius) {
   return { nx: dx / dist, ny: dy / dist, depth: minDist - dist };
 }
 
-// resolves collision between two players symmetrically: each gets half the
-// positional correction (so neither visually "wins" the collision), and
-// each has velocity reflected off the shared normal independently.
+// resolvePlayerPairCollision — resolves collision between two players
+// symmetrically: each gets half the positional correction (so neither
+// visually "wins" the collision), and each has velocity reflected off the
+// shared normal independently.
 function resolvePlayerPairCollision(playerA, playerB) {
   const hit = circleCircleCollision(
     playerA.position.x, playerA.position.y,
@@ -644,7 +765,8 @@ function resolvePlayerPairCollision(playerA, playerB) {
   }
 }
 
-// resolves every unique player pair once per tick (all-pairs, see note above)
+// resolveAllPlayerPairCollisions — resolves every unique player pair once
+// per tick (all-pairs, see circleCircleCollision's comment above).
 function resolveAllPlayerPairCollisions() {
   const ids = Object.keys(players);
   for (let i = 0; i < ids.length; i++) {
@@ -654,6 +776,8 @@ function resolveAllPlayerPairCollisions() {
   }
 }
 
+// formPlayerPrimitive — returns a fresh player state object with default
+// values, used as the template cloned for every newly joined player.
 function formPlayerPrimitive() {
   return {
     position: { x: 0, y: 0 },
@@ -668,8 +792,9 @@ function formPlayerPrimitive() {
   };
 }
 
-const INPUT_ORDER = ['left', 'right', 'up', 'down', 'fire', 'reload', 'ability'];
-
+// decodeInputs — unpacks a raw PLAYER_INPUTS bit code into a named
+// { left, right, up, down, fire, reload, ability } boolean map, per
+// INPUT_ORDER.
 function decodeInputs(code) {
   const result = {};
   INPUT_ORDER.forEach((action, i) => {
@@ -678,43 +803,13 @@ function decodeInputs(code) {
   return result;
 }
 
-const msgHandler = {
-  JOIN_REQUEST: (msg) => {
-    const playerPrimitive = formPlayerPrimitive();
-    const spawn = getRandomSpawnPoint();
-    playerPrimitive.position = { x: spawn.x, y: spawn.y };
-    players[msg.playerID] = structuredClone(playerPrimitive);
-    console.log(`[server] playerID ${msg.playerID} has joined at spawn point (${spawn.x.toFixed(1)}, ${spawn.y.toFixed(1)})!`);
-    sendMessage('JOIN_RESPONSE', msg.playerID, players[msg.playerID]);
-  },
-  LEAVE_REQUEST: (msg) => {
-    const existed = msg.playerID in players;
-    delete players[msg.playerID];
-    sendMessage('LEAVE_RESPONSE', msg.playerID, true);
-  },
-  PLAYER_INPUTS: (msg) => {
-    const player = players[msg.playerID];
-    if (!player) return; // inputs arrived before JOIN_REQUEST was processed, or after LEAVE
-
-    const inputs = decodeInputs(msg.inputs);
-
-    const dx = Number(inputs.right) - Number(inputs.left);
-    const dy = Number(inputs.up) - Number(inputs.down);
-    const scale = (dx !== 0 && dy !== 0) ? player_speed / Math.SQRT2 : player_speed;
-
-    player.desiredVelocity = { x: dx * scale, y: dy * -scale };
-
-    player.firing = inputs.fire;
-    player.reloading = inputs.reload;
-    player.usingAbility = inputs.ability;
-  },
-  PLAYER_AIM: (msg) => {
-    const player = players[msg.playerID];
-    if (!player) return;
-    player.aiming = msg.position;
-  },
-};
-
+// playerMovement — advances every player's velocity toward its
+// desiredVelocity by a flat ground_friction step, integrates position from
+// velocity, classifies at-rest players via MOVING_EPSILON (snapping
+// sub-epsilon velocity to exactly zero), and reports position back to the
+// client while moving and for exactly one extra tick after coming to a
+// stop (see MOVING_EPSILON's comment for why that final zero-velocity
+// packet matters).
 function playerMovement() {
   const dt = tickms / 1000; // seconds per tick
 
@@ -767,32 +862,12 @@ function playerMovement() {
   }
 }
 
-const methods = {
-  async messages() {
-    const messages = await pickupMessages();
-    for (const msg of messages) {
-      if (msg.type in msgHandler) msgHandler[msg.type](msg);
-    }
-  },
-  playerMovement,
-  bulletMovement() {/*leave empty for now*/},
-  playerAbilities() {/*leave empty for now*/},
-  playerCollisions() {
-    resolveAllPlayerPairCollisions();
-    for (const playerID in players) {
-      resolvePlayerCollisions(players[playerID]);
-      resolveArenaBoundary(players[playerID]);
-    }
-  },
-  bulletCollisions() {/*leave empty for now*/},
-  playerFiring() {/*leave empty for now*/},
-  playerReloading() {/*leave empty for now*/},
-  checkDataSubscriptions,
-};
-
-let tickInProgress = false;
-let nextTickTime = performance.now();
-
+// loop — the fixed-timestep tick driver. Runs every method in `methods` in
+// order if the previous tick has already finished (tickInProgress guards
+// against starting an overlapping tick if the main thread was slow to
+// respond to a pickup-request — that tick's slot is skipped rather than
+// overlapped), then reschedules itself for nextTickTime, advanced by tickms
+// regardless of how long this tick took.
 async function loop() {
   if (!tickInProgress) {
     tickInProgress = true;
@@ -812,4 +887,39 @@ async function loop() {
   const delay = Math.max(0, nextTickTime - performance.now());
   setTimeout(loop, delay);
 }
+
+// if running as a real Worker, announce that the server is alive
+(function init() {
+  const isWorker = typeof importScripts === 'function' || typeof WorkerGlobalScope !== 'undefined';
+  if (!isWorker) return;
+  postMessage({ type: 'server-alive' });
+})();
+
+// route incoming messages from the main thread to the appropriate handler
+self.onmessage = ({ data: msg }) => {
+  if (msg.type === 'pickup-response') {
+    pendingPickups.get(msg.requestId)?.(msg.batch ?? []);
+    pendingPickups.delete(msg.requestId);
+  } else if (msg.type === 'data-request') {
+    handleDataRequest(msg.requestId, msg.dataType, msg.mode);
+  } else if (msg.type === 'client-disconnected') {
+    handleClientDisconnected();
+  }
+};
+
+// populate the world with boxes, then build the spatial index over them
+spawnBoxes();
+buildSpatialIndex();
+
+// place player spawn points now that boxes exist to avoid; this can delete
+// boxes that are stubbornly blocking a spawn point (see spawnSpawnPoints'
+// final-attempt give-up path), which shrinks `boxes` after buildSpatialIndex()
+// already ran on the pre-deletion array — so the index has to be rebuilt
+// afterward, or boxesByMinX could hold stale entries pointing at box
+// indices that no longer exist (or worse, now point at a different box
+// that shifted into that slot after splice()).
+spawnSpawnPoints();
+buildSpatialIndex();
+
+// start the fixed-timestep tick loop
 loop();

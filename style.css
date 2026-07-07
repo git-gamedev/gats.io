@@ -1,7 +1,16 @@
+/* style.css
+   Styles for the game page: full-page canvas background, the pre-game menu
+   UI (weapon/shield select, play/servers buttons), the shared modal-overlay
+   system (server list, settings, host config), the settings panel and its
+   keybind editor, the minimap, and the notification card stack. */
+
+/* apply border-box sizing everywhere so padding/border don't add to
+   declared widths/heights */
 * {
   box-sizing: border-box;
 }
 
+/* fill the viewport, suppress scrolling, and center the page's flex content */
 html, body {
   margin: 0;
   padding: 0;
@@ -38,6 +47,7 @@ html, body {
   text-align: center;
 }
 
+/* the large weapon-selection box above the play/servers row */
 #weapon-select {
   width: 100%;
   min-height: 100px;
@@ -49,6 +59,7 @@ html, body {
   margin-bottom: 8px;
 }
 
+/* row holding the shield-select box plus the servers/play buttons */
 #row2 {
   display: flex;
   align-items: stretch;
@@ -57,6 +68,7 @@ html, body {
   gap: 8px;
 }
 
+/* the small shield-amount box within row2 */
 #shield-select {
   flex: 1;
   min-height: 50px;
@@ -67,6 +79,8 @@ html, body {
   justify-content: center;
 }
 
+/* buttons within row2 (servers/play) keep their natural width and get
+   horizontal padding */
 #row2 button {
   flex-shrink: 0;
   padding: 0 16px;
@@ -86,10 +100,12 @@ html, body {
   justify-content: center;
 }
 
+/* hides any overlay carrying the .hidden class */
 .overlay.hidden {
   display: none;
 }
 
+/* the white rounded panel shown inside any overlay */
 .panel {
   background: #fff;
   padding: 20px;
@@ -97,10 +113,12 @@ html, body {
   border-radius: 4px;
 }
 
+/* host-config panel's own minimum width (currently same as .panel's) */
 #host-config-panel {
   min-width: 300px;
 }
 
+/* right-aligned action button row at the bottom of the host-config panel */
 #host-config-actions {
   display: flex;
   justify-content: flex-end;
@@ -108,6 +126,7 @@ html, body {
   margin-top: 12px;
 }
 
+/* scrollable list container for open servers in the server menu */
 #server-list {
   width: 100%;
   min-height: 120px;
@@ -120,6 +139,7 @@ html, body {
   margin-bottom: 12px;
 }
 
+/* centered placeholder message shown in the server list when empty */
 .server-list-message {
   flex: 1;
   display: flex;
@@ -130,6 +150,7 @@ html, body {
   font-size: 14px;
 }
 
+/* one row in the server list, representing a single joinable server */
 .server-row {
   display: flex;
   align-items: center;
@@ -139,10 +160,13 @@ html, body {
   border-bottom: 1px solid #ddd;
 }
 
+/* the last server row has no bottom divider */
 .server-row:last-child {
   border-bottom: none;
 }
 
+/* wrapping info group (location, player count, modded badge) within a
+   server row */
 .server-row-info {
   display: flex;
   align-items: center;
@@ -151,14 +175,17 @@ html, body {
   font-size: 14px;
 }
 
+/* bolded location label within a server row */
 .server-row-location {
   font-weight: bold;
 }
 
+/* muted player-count text within a server row */
 .server-row-players {
   color: #555;
 }
 
+/* small dark "modded" badge within a server row */
 .server-row-modded {
   background: #333;
   color: #fff;
@@ -167,10 +194,12 @@ html, body {
   border-radius: 3px;
 }
 
+/* the connect button within a server row keeps its natural width */
 .server-row-connect {
   flex-shrink: 0;
 }
 
+/* horizontal spacing between buttons in the server menu */
 #menu button {
   margin: 0 4px;
 }
@@ -189,6 +218,7 @@ html, body {
   line-height: 1;
 }
 
+/* the settings panel's own size constraints and left-aligned text */
 #settings-panel {
   min-width: 340px;
   max-width: 90vw;
@@ -197,6 +227,8 @@ html, body {
   text-align: left;
 }
 
+/* one labeled control row within the settings panel (color pickers,
+   opacity slider) */
 .setting-row {
   display: flex;
   align-items: center;
@@ -205,6 +237,8 @@ html, body {
   margin-bottom: 12px;
 }
 
+/* one row in the keybind editor, holding an action's label, bind chips,
+   and add button */
 .keybind-row {
   display: flex;
   align-items: center;
@@ -214,12 +248,14 @@ html, body {
   border-top: 1px solid #ddd;
 }
 
+/* fixed-width bold label naming the action in a keybind row */
 .keybind-label {
   width: 60px;
   flex-shrink: 0;
   font-weight: bold;
 }
 
+/* wrapping container for an action's individual bind chips */
 .keybind-chips {
   display: flex;
   flex-wrap: wrap;
@@ -227,6 +263,7 @@ html, body {
   flex: 1;
 }
 
+/* a single bind chip (e.g. "w") shown within keybind-chips */
 .keybind-chip {
   display: inline-flex;
   align-items: center;
@@ -238,6 +275,7 @@ html, body {
   font-size: 13px;
 }
 
+/* the small remove (×) button embedded in a bind chip */
 .keybind-chip .remove-bind {
   border: none;
   background: none;
@@ -247,11 +285,14 @@ html, body {
   line-height: 1;
 }
 
+/* disabled styling for a remove-bind button, shown when it's an action's
+   last remaining bind */
 .keybind-chip .remove-bind:disabled {
   opacity: 0.3;
   cursor: not-allowed;
 }
 
+/* the "+ Add" button at the end of a keybind row */
 .add-bind {
   font-size: 13px;
   padding: 2px 8px;
@@ -268,6 +309,7 @@ html, body {
   pointer-events: none;
 }
 
+/* a single notification card within the stack */
 .notif-card {
   position: absolute;
   left: 0;
@@ -280,6 +322,7 @@ html, body {
   transition: bottom 0.5s ease;
 }
 
+/* minimap canvas, fixed to the top-right corner, fading on hover */
 #mini-map {
   position: fixed;
 
@@ -297,10 +340,13 @@ html, body {
   transition: opacity 0.5s;
 }
 
+/* fade the minimap out on hover so it doesn't obscure gameplay underneath it */
 #mini-map:hover {
   opacity: 0.25;
 }
 
+/* generic fully-transparent utility class, used for the minimap's hidden
+   state before a game starts */
 .hidden {
   opacity: 0;
 }
